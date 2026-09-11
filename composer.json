@@ -1,0 +1,38 @@
+{
+    "name": "block-bot/moderation-bot",
+    "description": "Telegram professional AI & deterministic group moderation bot in PHP with MySQL, Google Gemini and OpenRouter",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1",
+        "ext-pdo": "*",
+        "ext-pdo_mysql": "*",
+        "ext-curl": "*",
+        "ext-mbstring": "*",
+        "ext-json": "*",
+        "ext-gd": "*",
+        "ext-fileinfo": "*",
+        "ext-zip": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "App\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "migrate": "php bin/migrate.php",
+        "diagnose": "php bin/diagnose.php",
+        "worker": "php bin/worker.php",
+        "cron": "php bin/cron.php"
+    },
+    "config": {
+        "sort-packages": true,
+        "optimize-autoloader": true,
+        "allow-plugins": {}
+    }
+}

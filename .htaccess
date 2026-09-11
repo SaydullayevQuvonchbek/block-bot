@@ -1,0 +1,15 @@
+# Maxfiy va tizimli fayllarni bevosita ochishni taqiqlash
+<FilesMatch "^\.|\.(env|sql|log|session|lock|json|md)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# Ichki tizim papkalariga to'g'ridan-to'g'ri HTTP so'rovlarni taqiqlash
+RedirectMatch 403 ^/(storage|database|src|config|bin|vendor)(/|$)
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^webhook\.php$ public/webhook.php [L,QSA]
+    RewriteRule ^$ public/index.html [L]
+</IfModule>
+

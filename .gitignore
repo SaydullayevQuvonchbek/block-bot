@@ -1,0 +1,14 @@
+/.env
+/.idea/
+/.vscode/
+/storage/logs/*.log
+/storage/temp/*
+/storage/sessions/*
+!/storage/logs/.gitkeep
+!/storage/temp/.gitkeep
+!/storage/sessions/.gitkeep
+/vendor/
+composer.phar
+*.session
+*.session.lock
+
