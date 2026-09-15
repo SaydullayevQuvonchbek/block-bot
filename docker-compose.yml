@@ -1,0 +1,80 @@
+# Block-BOT — lokal ishlab chiqish / VPS Docker joylashtirish
+#
+# Ishga tushirish:
+#   cp .env.example .env   # va qiymatlarni to'ldiring
+#   docker compose up -d --build
+#   docker compose exec app php bin/migrate.php
+#   docker compose exec app php bin/set_webhook.php set
+#
+# Topologiya production (HestiaCP) bilan bir xil: public/ — web-root,
+# vendor/ src/ config/ bin/ storage/ undan tashqarida (docker/php/Dockerfile
+# va docker/nginx/default.conf'ga qarang).
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - storage_data:/app/storage
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - blockbot
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+    restart: unless-stopped
+    command: ["php", "bin/worker.php"]
+    volumes:
+      - storage_data:/app/storage
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - blockbot
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8080}:80"
+    volumes:
+      - ./public:/app/public:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    networks:
+      - blockbot
+
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASS:-root}
+      MYSQL_DATABASE: ${DB_NAME:-block_bot}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASS:-root}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - blockbot
+
+volumes:
+  db_data:
+  storage_data:
+
+networks:
+  blockbot:
+    driver: bridge

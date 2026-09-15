@@ -11,4 +11,5 @@
 composer.phar
 *.session
 *.session.lock
+/Claude outputs/
 

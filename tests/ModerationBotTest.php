@@ -429,17 +429,39 @@ class ModerationBotTest extends TestCase
 
     public function testStatsAdminCommandIsImplemented(): void
     {
+        // Buyruqlar endi faqat shaxsiy chatda (DM) ishlaydi — guruhda /stats javobsiz qoladi,
+        // shu bois admin bu buyruqni botning shaxsiy chatiga yozadi (UpdateRouter avtomatik
+        // ravishda uning yagona boshqaradigan guruhini tanlaydi).
+        $chatId = -1007771;
+        SettingsService::get($chatId);
+        (new AdminAuthorizationService())->isAdmin($chatId, 1);
+
         $router = new UpdateRouter();
         $result = $router->handle([
             'update_id' => 991234,
             'message' => [
                 'message_id' => 7123,
-                'chat' => ['id' => -1007771, 'type' => 'supergroup'],
+                'chat' => ['id' => 1, 'type' => 'private'],
                 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'],
                 'text' => '/stats',
             ],
         ]);
-        $this->assertEquals('command_executed', $result['status']);
+        // Testlar bitta baza ustida ketma-ket ishlagani uchun user#1 avvalgi testlardan boshqa
+        // guruhlarga ham admin bo'lib qolgan bo'lishi mumkin — shu sabab natija yo bevosita
+        // bajarilishi (bitta guruh bo'lsa), yo guruh tanlash tugmasi (bir nechta bo'lsa) bo'ladi.
+        $this->assertTrue(in_array($result['status'], ['private_admin_action', 'private_group_picker_sent'], true));
+
+        // Guruhning o'zida esa buyruq endi umuman ishlamasligini (chetlab o'tilishini) tasdiqlaymiz.
+        $groupResult = $router->handle([
+            'update_id' => 991235,
+            'message' => [
+                'message_id' => 7124,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => '/stats',
+            ],
+        ]);
+        $this->assertTrue($groupResult['status'] !== 'command_executed', "Guruhda buyruq bajarilmasligi kerak, olindi: {$groupResult['status']}");
     }
 
     public function testUnsafeProfileCacheDoesNotBecomeSafe(): void
@@ -966,12 +988,18 @@ class ModerationBotTest extends TestCase
      */
     public function testBlockwordAllowwordAndWordlistCommands(): void
     {
+        // Buyruqlar endi faqat shaxsiy chatda (DM) ishlaydi. Admin yagona guruhni boshqargani
+        // uchun UpdateRouter uni avtomatik nishonga oladi (guruh ID kiritish shart emas).
         $chatId = -100823;
+        SettingsService::get($chatId);
+        (new AdminAuthorizationService())->isAdmin($chatId, 1);
         $router = new UpdateRouter();
 
+        // Boshqa testlardan user#1 allaqachon bir nechta guruhga admin bo'lib qolgan bo'lishi
+        // mumkin bo'lgani uchun, aniqlik uchun guruh ID'ni buyruq matniga qo'shib yuboramiz.
         $add = $router->handle([
             'update_id' => 994060,
-            'message' => ['message_id' => 9600, 'chat' => ['id' => $chatId, 'type' => 'supergroup'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => '/blockword qashqaldoq'],
+            'message' => ['message_id' => 9600, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/blockword {$chatId} qashqaldoq"],
         ]);
         $this->assertEquals('command_executed', $add['status']);
 
@@ -981,18 +1009,71 @@ class ModerationBotTest extends TestCase
 
         $list = $router->handle([
             'update_id' => 994061,
-            'message' => ['message_id' => 9601, 'chat' => ['id' => $chatId, 'type' => 'supergroup'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => '/wordlist'],
+            'message' => ['message_id' => 9601, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/wordlist {$chatId}"],
         ]);
         $this->assertEquals('command_executed', $list['status']);
 
         $rm = $router->handle([
             'update_id' => 994062,
-            'message' => ['message_id' => 9602, 'chat' => ['id' => $chatId, 'type' => 'supergroup'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => '/unblockword qashqaldoq'],
+            'message' => ['message_id' => 9602, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/unblockword {$chatId} qashqaldoq"],
         ]);
         $this->assertEquals('command_executed', $rm['status']);
 
+        // Guruhning o'zida esa buyruq endi umuman ishlamasligini tasdiqlaymiz.
+        $groupAttempt = $router->handle([
+            'update_id' => 994063,
+            'message' => ['message_id' => 9603, 'chat' => ['id' => $chatId, 'type' => 'supergroup'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => '/blockword yana_bir_soz'],
+        ]);
+        $this->assertTrue($groupAttempt['status'] !== 'command_executed', "Guruhda buyruq bajarilmasligi kerak, olindi: {$groupAttempt['status']}");
+
         $res2 = $moderator->inspect('sen qashqaldoq ekansan', [], 'economical', $chatId, 'bw2');
         $this->assertEquals('safe', $res2['status'], "O'chirilgan qoida endi ishlamasligi kerak");
+    }
+
+    /**
+     * 44b. Guruhda faqat reply-asosidagi to'g'ridan-to'g'ri moderatsiya buyruqlari
+     * (/mute, /ban va h.k.) ishlashda davom etadi — bular shaxsiy chatga ko'chirib
+     * bo'lmaydi. Boshqa har qanday buyruq ("/menu" kabi) guruhda javobsiz qoladi.
+     */
+    public function testDirectModerationCommandsStillWorkInGroupButOthersDont(): void
+    {
+        $chatId = -100919191;
+        $targetUserId = 55201;
+        SettingsService::get($chatId);
+        (new AdminAuthorizationService())->isAdmin($chatId, 1);
+
+        $router = new UpdateRouter();
+        $muteResult = $router->handle([
+            'update_id' => 994200,
+            'message' => [
+                'message_id' => 9700,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => '/mute 2',
+                'reply_to_message' => [
+                    'message_id' => 9699,
+                    'from' => ['id' => $targetUserId, 'is_bot' => false, 'first_name' => 'Toxic'],
+                ],
+            ],
+        ]);
+        $this->assertEquals('command_executed', $muteResult['status']);
+
+        $muteCount = (int)Database::getConnection()
+            ->query("SELECT COUNT(*) FROM telegram_actions WHERE chat_id = {$chatId} AND action_type = 'mute_user'")
+            ->fetchColumn();
+        $this->assertTrue($muteCount > 0, "/mute guruhda haqiqatda ijro etilishi kerak");
+
+        // Ammo DM-only bo'lgan har qanday boshqa buyruq ("/menu" kabi) guruhda javobsiz qoladi.
+        $menuAttempt = $router->handle([
+            'update_id' => 994201,
+            'message' => [
+                'message_id' => 9701,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => '/menu',
+            ],
+        ]);
+        $this->assertTrue($menuAttempt['status'] !== 'command_executed', "Guruhda /menu javob qaytarmasligi kerak, olindi: {$menuAttempt['status']}");
     }
 
     /**

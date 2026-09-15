@@ -184,10 +184,23 @@ class UpdateRouter
             }
         }
 
+        // GURUHDA FAQAT TO'G'RIDAN-TO'G'RI MODERATSIYA BUYRUQLARI ISHLAYDI: admin botni
+        // asosan shaxsiy chatda (DM) boshqaradi (/menu, /settings, /stats, /blockword va
+        // h.k. — o'sha yerda ishlaydi). Istisno — /warn, /mute, /ban, /unmute, /unban,
+        // /resetwarns, /warnings: bular ma'lum bir xabarga "reply" qilib berilgani uchun
+        // shaxsiy chatga ko'chirib bo'lmaydi, shu bois guruhda qoldirilgan (o'zi hech
+        // qanday keraksiz "menyu" xabari chiqarmaydi — faqat amal natijasini yozadi).
+        // Qolgan barcha "/..." matni pastdagi oddiy moderatsiyadan o'tishda davom etadi.
+        // Avtomatik ogohlantirish/jazo (warn/mute/ban) xabarlari ModerateMessageJob/
+        // PunishmentService orqali ishlaydi va bunga umuman ta'sir qilmaydi.
+        static $groupAllowedCommands = ['/warn', '/mute', '/ban', '/unmute', '/unban', '/resetwarns', '/warnings'];
         if (str_starts_with($rawText, '/')) {
-            $cmdResult = $this->handleCommand($message, $rawText, $chatId);
-            if ($cmdResult !== null) {
-                return $cmdResult;
+            $cmdOnly = strtolower(explode('@', explode(' ', trim($rawText))[0])[0]);
+            if (in_array($cmdOnly, $groupAllowedCommands, true)) {
+                $cmdResult = $this->handleCommand($message, $rawText, $chatId);
+                if ($cmdResult !== null) {
+                    return $cmdResult;
+                }
             }
         }
 
@@ -257,6 +270,14 @@ class UpdateRouter
         }
     }
 
+    /**
+     * DIQQAT: bu metod endi FAQAT guruhda qoladigan 7 ta to'g'ridan-to'g'ri moderatsiya
+     * buyrug'i (/warn, /mute, /ban, /unmute, /unban, /resetwarns, /warnings) uchun
+     * chaqiriladi — handleMessage() dagi $groupAllowedCommands ro'yxatiga qarang. Qolgan
+     * barcha admin buyruqlari (/settings, /status, /stats, /ai_usage, /scan_members,
+     * /audit*, /blockword-oilasi, /wordlist) endi faqat shaxsiy chatda (handlePrivateChat)
+     * ishlaydi, chunki ular reply-kontekstiga bog'liq emas va DM'ga ko'chirilgan.
+     */
     private function handleCommand(array $message, string $text, int $chatId): ?array
     {
         $parts = explode(' ', trim($text));
@@ -266,180 +287,11 @@ class UpdateRouter
         $senderChat = $message['sender_chat'] ?? null;
 
         $isAdmin = $this->auth->isAdmin($chatId, $userId, $senderChat);
-
-        // /start va /help guruhni keraksiz bot xabarlari bilan to'ldirmaydi.
-        if (in_array($cmd, ['/start', '/help'], true)) {
-            if (!$isAdmin) {
-                return ['status' => 'command_ignored', 'cmd' => $cmd];
-            }
-            if ($isAdmin) {
-                $help = "🤖 <b>Block-BOT Moderatsiya Boti</b>\n\n"
-                    . "<b>Admin buyruqlari:</b>\n"
-                    . "/settings - Guruh sozlamalarini boshqarish\n"
-                    . "/status - Bot holati va faol modullar\n"
-                    . "/stats - Guruh moderatsiya statistikasi\n"
-                    . "/warn - Foydalanuvchiga ogohlantirish berish (reply orqali)\n"
-                    . "/warnings - Ogohlantirishlarni ko'rish\n"
-                    . "/resetwarns - Ogohlantirishlarni bekor qilish\n"
-                    . "/mute [soat] - Vaqtincha cheklash (reply orqali)\n"
-                    . "/unmute - Cheklovni yechish\n"
-                    . "/ban - Guruhdan chiqarish\n"
-                    . "/unban - Bandan chiqarish\n"
-                    . "/blockword so'z - Maxsus so'z/iborani taqiqlash (jargon/lahja)\n"
-                    . "/allowword so'z - Begunoh so'zni istisno qilish\n"
-                    . "/unblockword so'z - Qoidani o'chirish\n"
-                    . "/wordlist - Guruhning maxsus so'z qoidalari ro'yxati\n"
-                    . "/scan_members - A'zolarni 18+ / bot akkauntlarga tekshirish\n"
-                    . "/audit [mtproto|json] - Tarixiy auditni boshlash\n"
-                    . "/audit_status - Audit jarayoni holati\n"
-                    . "/audit_pause - Auditni to'xtatib turish\n"
-                    . "/audit_resume - Auditni davom ettirish\n"
-                    . "/audit_cancel - Auditni bekor qilish\n"
-                    . "/audit_report - Audit hisobotini olish\n"
-                    . "/ai_usage - AI xarajatlari va budjet sarfi";
-            }
-            $this->telegram->sendMessage($chatId, $help);
-            return ['status' => 'command_executed', 'cmd' => $cmd];
-        }
-
-        // Qolgan buyruqlar faqat adminlar uchun
         if (!$isAdmin) {
             return null; // Oddiy a'zolarga guruhda ortiqcha xabar chiqarmaymiz
         }
 
         switch ($cmd) {
-
-            case '/settings':
-                $messageId = (int)($message['message_id'] ?? 0);
-                if ($chatId < 0) {
-                    if ($messageId > 0) {
-                        $this->telegram->deleteMessage($chatId, $messageId);
-                    }
-                    $pmRes = $this->sendSettingsMenu($chatId, null, $userId);
-                    if (!($pmRes['ok'] ?? false)) {
-                        $botUser = Config::get('TELEGRAM_BOT_USERNAME', 'kj_blocker_bot');
-                        $btn = [
-                            'inline_keyboard' => [
-                                [
-                                    ['text' => "⚙️ Sozlamalarni shaxsiyda ochish", 'url' => "https://t.me/{$botUser}?start=settings_{$chatId}"]
-                                ]
-                            ]
-                        ];
-                        $this->telegram->sendMessage($chatId, "⚙️ Guruh sozlamalarini boshqarish uchun pastdagi tugmani bosing:", ['reply_markup' => $btn]);
-                    }
-                } else {
-                    $this->sendSettingsMenu($chatId);
-                }
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/status':
-                $statusMsg = "⚙️ <b>Bot Tizim Holati:</b>\n"
-                    . "• Webhook: Faol ✅\n"
-                    . "• Baza ulanishi: Barqaror ✅\n"
-                    . "• AI Rejimi: <b>" . SettingsService::get($chatId)['ai_mode'] . "</b>\n"
-                    . "• PHP versiyasi: " . PHP_VERSION . "\n"
-                    . "• Vaqt zonasi: " . Config::get('APP_TIMEZONE', 'Asia/Tashkent');
-                $this->telegram->sendMessage($chatId, $statusMsg);
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/stats':
-                $pdo = Database::getConnection();
-                $since = gmdate('Y-m-d H:i:s', time() - 30 * 86400);
-                $queries = [
-                    'findings' => "SELECT COUNT(*) FROM moderation_findings WHERE chat_id = :cid AND created_at >= :since",
-                    'actions' => "SELECT COUNT(*) FROM telegram_actions WHERE chat_id = :cid AND created_at >= :since AND status IN ('executed', 'partial')",
-                    'warnings' => "SELECT COUNT(*) FROM user_warnings WHERE chat_id = :cid AND is_active = 1 AND expires_at > :now",
-                ];
-                $stats = [];
-                foreach ($queries as $key => $sql) {
-                    $stmt = $pdo->prepare($sql);
-                    $params = ['cid' => $chatId];
-                    $params[$key === 'warnings' ? 'now' : 'since'] = $key === 'warnings' ? gmdate('Y-m-d H:i:s') : $since;
-                    $stmt->execute($params);
-                    $stats[$key] = (int)$stmt->fetchColumn();
-                }
-                $this->telegram->sendMessage($chatId, "📈 <b>Oxirgi 30 kun statistikasi</b>\n• Topilmalar: {$stats['findings']}\n• Bajarilgan choralar: {$stats['actions']}\n• Faol ogohlantirishlar: {$stats['warnings']}");
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/ai_usage':
-                $stats = UsageBudgetService::getSummaryStats($chatId);
-                $msg = "📊 <b>AI Xarajatlari va Budjet:</b>\n\n"
-                    . "• Bugungi so'rovlar: {$stats['today_requests']}\n"
-                    . "• Bugungi tokenlar: {$stats['today_tokens']}\n"
-                    . "• Bugungi sarf: \${$stats['today_cost_usd']} / \${$stats['daily_limit_usd']}\n"
-                    . "• Oylik sarf: \${$stats['month_cost_usd']} / \${$stats['monthly_limit_usd']}\n"
-                    . "• Budjet holati: " . ($stats['is_available'] ? "Faol ✅" : "Chegaraga yetgan ⚠️");
-                $this->telegram->sendMessage($chatId, $msg);
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/scan_members':
-                $aiMode = (string)(SettingsService::get($chatId)['ai_mode'] ?? 'economical');
-                $sessionId = AuditService::createSession($chatId, $userId, 'member_sweep', 'all', $aiMode);
-                $this->telegram->sendMessage($chatId, "👥 A'zolar tekshiruvi #{$sessionId} navbatga qo'yildi. 18+ profil va ruxsatsiz bot akkauntlar aniqlanadi; hisobot administratorga yuboriladi.");
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/audit':
-                $source = strtolower((string)($parts[1] ?? 'auto'));
-                if ($source === 'auto') {
-                    $reader = new \App\Audit\MtprotoHistoryReader();
-                    $source = ($reader->isConfigured() && class_exists('\danog\MadelineProto\API')) ? 'mtproto' : 'json';
-                }
-                if ($source === 'mtproto') {
-                    $reader = new \App\Audit\MtprotoHistoryReader();
-                    if (!$reader->isConfigured() || !class_exists('\danog\MadelineProto\API')) {
-                        $this->telegram->sendMessage($chatId, "❌ MTProto sozlanmagan. MTPROTO_API_ID/API_HASH va MadelineProto kutubxonasini tekshiring.");
-                        return ['status' => 'error', 'reason' => 'mtproto_not_configured'];
-                    }
-                    $sessionId = AuditService::createSession($chatId, $userId, 'mtproto', 'all', 'economical');
-                    $this->telegram->sendMessage($chatId, "🚀 MTProto audit sessiyasi #{$sessionId} navbatga qo'yildi.");
-                } else {
-                    $sessionId = AuditService::createSession($chatId, $userId, 'json_export', 'all', 'economical');
-                    $this->telegram->sendMessage($chatId, "📦 Audit sessiyasi #{$sessionId} yaratildi. Telegram Bot API eski tarixni o'qiy olmaydi. Telegram Desktop eksportidagi <b>result.json</b> yoki ZIP faylni shu guruhga hujjat sifatida yuboring (maksimum 20 MB), yoki serverda MTProto'ni sozlab <code>/audit mtproto</code> buyrug'idan foydalaning.");
-                }
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/audit_status':
-                $session = AuditService::latestForChat($chatId);
-                if (!$session) {
-                    $this->telegram->sendMessage($chatId, "Audit sessiyasi topilmadi.");
-                } else {
-                    $this->telegram->sendMessage($chatId, "📊 Audit #{$session['id']}\n• Manba: {$session['source_type']}\n• Holat: <b>{$session['status']}</b>\n• Tekshirildi: {$session['total_scanned']}\n• Topilmalar: {$session['total_flagged']}" . (!empty($session['error_message']) ? "\n• Xato: " . htmlspecialchars((string)$session['error_message'], ENT_QUOTES, 'UTF-8') : ''));
-                }
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/audit_pause':
-            case '/audit_resume':
-            case '/audit_cancel':
-                $session = AuditService::latestForChat($chatId, ['waiting_upload', 'running', 'paused']);
-                if (!$session) {
-                    $this->telegram->sendMessage($chatId, "Faol audit sessiyasi topilmadi.");
-                    return ['status' => 'error', 'reason' => 'audit_not_found'];
-                }
-                $ok = match ($cmd) {
-                    '/audit_pause' => AuditService::pause((int)$session['id']),
-                    '/audit_resume' => AuditService::resume((int)$session['id']),
-                    '/audit_cancel' => AuditService::cancel((int)$session['id']),
-                };
-                $labels = ['/audit_pause' => "to'xtatildi", '/audit_resume' => 'davom ettirildi', '/audit_cancel' => 'bekor qilindi'];
-                $this->telegram->sendMessage($chatId, $ok ? "✅ Audit #{$session['id']} {$labels[$cmd]}." : "❌ Audit holatini o'zgartirib bo'lmadi.");
-                return ['status' => $ok ? 'command_executed' : 'error', 'cmd' => $cmd];
-
-            case '/audit_report':
-                // Oxirgi audit sessiyasini topish
-                $pdo = Database::getConnection();
-                $stmt = $pdo->prepare("SELECT id FROM audit_sessions WHERE chat_id = :cid ORDER BY id DESC LIMIT 1");
-                $stmt->execute(['cid' => $chatId]);
-                $lastSessionId = (int)$stmt->fetchColumn();
-
-                if ($lastSessionId > 0) {
-                    $summary = ReportService::generateTelegramSummary($lastSessionId);
-                    $this->telegram->sendMessage($chatId, $summary);
-                    $this->sendAuditReportFiles($chatId, $lastSessionId);
-                } else {
-                    $this->telegram->sendMessage($chatId, "Guruhda hali audit o'tkazilmagan.");
-                }
-                return ['status' => 'command_executed', 'cmd' => $cmd];
-
             case '/warn':
             case '/mute':
             case '/ban':
@@ -468,14 +320,6 @@ class UpdateRouter
                 }
                 $this->telegram->sendMessage($chatId, $msg);
                 return ['status' => 'command_executed', 'cmd' => $cmd];
-
-            case '/blockword':
-            case '/allowword':
-            case '/unblockword':
-                return $this->handleWordRuleCommand($cmd, $text, $parts, $chatId);
-
-            case '/wordlist':
-                return $this->handleWordListCommand($chatId);
         }
 
         return null;
@@ -486,11 +330,12 @@ class UpdateRouter
      * (/blockword, /allowword, /unblockword). Jargon/lahjadagi so'kinishlarni
      * o'rnatilgan ro'yxatga qo'shimcha ravishda mahalliy tarzda taqiqlash imkonini beradi.
      */
-    private function handleWordRuleCommand(string $cmd, string $text, array $parts, int $chatId): array
+    private function handleWordRuleCommand(string $cmd, string $text, array $parts, int $chatId, ?int $replyChatId = null): array
     {
+        $replyChatId ??= $chatId;
         $phrase = trim(mb_substr($text, mb_strlen($parts[0])));
         if ($phrase === '' || mb_strlen($phrase) > 100) {
-            $this->telegram->sendMessage($chatId, "Foydalanish: <code>{$cmd} so'z_yoki_ibora</code> (1-100 belgi).\nMasalan: <code>{$cmd} qashqaldoq</code>");
+            $this->telegram->sendMessage($replyChatId, "Foydalanish: <code>{$cmd} so'z_yoki_ibora</code> (1-100 belgi).\nMasalan: <code>{$cmd} qashqaldoq</code>");
             return ['status' => 'error', 'reason' => 'phrase_required'];
         }
 
@@ -498,7 +343,7 @@ class UpdateRouter
         if ($cmd === '/unblockword') {
             $stmt = $pdo->prepare("DELETE FROM word_rules WHERE chat_id = :cid AND word_pattern = :p");
             $stmt->execute(['cid' => $chatId, 'p' => $phrase]);
-            $this->telegram->sendMessage($chatId, $stmt->rowCount() > 0
+            $this->telegram->sendMessage($replyChatId, $stmt->rowCount() > 0
                 ? "✅ \"" . htmlspecialchars($phrase, ENT_QUOTES, 'UTF-8') . "\" ro'yxatdan olib tashlandi."
                 : "ℹ️ Bunday qoida topilmadi.");
             return ['status' => 'command_executed', 'cmd' => $cmd];
@@ -508,7 +353,7 @@ class UpdateRouter
         $existsStmt = $pdo->prepare("SELECT id FROM word_rules WHERE chat_id = :cid AND word_pattern = :p AND rule_type = :t");
         $existsStmt->execute(['cid' => $chatId, 'p' => $phrase, 't' => $ruleType]);
         if ($existsStmt->fetch()) {
-            $this->telegram->sendMessage($chatId, "ℹ️ Bu ibora allaqachon ro'yxatda.");
+            $this->telegram->sendMessage($replyChatId, "ℹ️ Bu ibora allaqachon ro'yxatda.");
             return ['status' => 'already_exists', 'cmd' => $cmd];
         }
 
@@ -516,12 +361,13 @@ class UpdateRouter
             ->execute(['cid' => $chatId, 't' => $ruleType, 'p' => $phrase, 'now' => gmdate('Y-m-d H:i:s')]);
 
         $label = $ruleType === 'whitelist' ? "oq ro'yxatga (hech qachon bloklanmaydi)" : "qora ro'yxatga (darhol o'chiriladi)";
-        $this->telegram->sendMessage($chatId, "✅ \"" . htmlspecialchars($phrase, ENT_QUOTES, 'UTF-8') . "\" {$label} qo'shildi.");
+        $this->telegram->sendMessage($replyChatId, "✅ \"" . htmlspecialchars($phrase, ENT_QUOTES, 'UTF-8') . "\" {$label} qo'shildi.");
         return ['status' => 'command_executed', 'cmd' => $cmd];
     }
 
-    private function handleWordListCommand(int $chatId): array
+    private function handleWordListCommand(int $chatId, ?int $replyChatId = null): array
     {
+        $replyChatId ??= $chatId;
         $stmt = Database::getConnection()->prepare("
             SELECT rule_type, word_pattern FROM word_rules
             WHERE chat_id = :cid ORDER BY rule_type, id DESC LIMIT 50
@@ -530,7 +376,7 @@ class UpdateRouter
         $rows = $stmt->fetchAll();
 
         if (!$rows) {
-            $this->telegram->sendMessage($chatId, "Bu guruh uchun maxsus so'z qoidalari yo'q.\nQo'shish: <code>/blockword so'z</code> yoki <code>/allowword so'z</code>");
+            $this->telegram->sendMessage($replyChatId, "Bu guruh uchun maxsus so'z qoidalari yo'q.\nQo'shish: <code>/blockword so'z</code> yoki <code>/allowword so'z</code>");
             return ['status' => 'command_executed', 'cmd' => '/wordlist'];
         }
 
@@ -550,8 +396,56 @@ class UpdateRouter
             }
         }
         $msg .= "\n<i>O'chirish: /unblockword so'z</i>";
-        $this->telegram->sendMessage($chatId, $msg);
+        $this->telegram->sendMessage($replyChatId, $msg);
         return ['status' => 'command_executed', 'cmd' => '/wordlist'];
+    }
+
+    /**
+     * Shaxsiy chatda /blockword, /allowword, /unblockword, /wordlist buyruqlari uchun
+     * qaysi guruhga tegishli ekanini aniqlaydi. Admin faqat bitta guruhni boshqarsa —
+     * avtomatik shu guruh tanlanadi; bir nechta bo'lsa, buyruq guruh ID bilan
+     * boshlanishi kerak (masalan: "/blockword -1001234567890 so'z").
+     *
+     * @return array{chat_id:int, rest:string, error:?string, groups:array}
+     */
+    private function resolvePrivateManagedChat(int $userId, string $arg): array
+    {
+        $groups = $this->adminGroupsOf($userId);
+        if ($groups === []) {
+            return ['chat_id' => 0, 'rest' => '', 'error' => 'no_groups', 'groups' => []];
+        }
+
+        if (preg_match('/^(-?\d{6,})(?:\s+(.*))?$/s', $arg, $m)) {
+            $chatId = (int)$m[1];
+            $rest = trim((string)($m[2] ?? ''));
+            $known = false;
+            foreach ($groups as $g) {
+                if ((int)$g['chat_id'] === $chatId) {
+                    $known = true;
+                    break;
+                }
+            }
+            if (!$known || !$this->auth->isAdmin($chatId, $userId)) {
+                return ['chat_id' => 0, 'rest' => '', 'error' => 'unauthorized', 'groups' => $groups];
+            }
+            return ['chat_id' => $chatId, 'rest' => $rest, 'error' => null, 'groups' => $groups];
+        }
+
+        if (count($groups) === 1) {
+            return ['chat_id' => (int)$groups[0]['chat_id'], 'rest' => trim($arg), 'error' => null, 'groups' => $groups];
+        }
+
+        return ['chat_id' => 0, 'rest' => trim($arg), 'error' => 'ambiguous', 'groups' => $groups];
+    }
+
+    private function managedGroupsHintText(array $groups): string
+    {
+        $lines = [];
+        foreach ($groups as $g) {
+            $gId = (int)$g['chat_id'];
+            $lines[] = "• " . $this->resolveGroupTitle($gId, (string)($g['title'] ?? '')) . " — <code>{$gId}</code>";
+        }
+        return implode("\n", $lines);
     }
 
     private function handleModerationCommand(string $cmd, array $message, array $parts, int $chatId): array
@@ -1069,6 +963,35 @@ class UpdateRouter
             return ['status' => 'audit_report_sent', 'session_id' => $sessionId];
         }
 
+        if (in_array($action, ['audit_pause', 'audit_resume', 'audit_cancel'], true)) {
+            $session = AuditService::latestForChat($chatId, ['waiting_upload', 'running', 'paused']);
+            if (!$session) {
+                $this->telegram->sendMessage($targetChatId, "Bu guruh uchun faol audit sessiyasi topilmadi.");
+                return ['status' => 'audit_not_found'];
+            }
+            $ok = match ($action) {
+                'audit_pause' => AuditService::pause((int)$session['id']),
+                'audit_resume' => AuditService::resume((int)$session['id']),
+                'audit_cancel' => AuditService::cancel((int)$session['id']),
+            };
+            $labels = ['audit_pause' => "to'xtatildi", 'audit_resume' => 'davom ettirildi', 'audit_cancel' => 'bekor qilindi'];
+            $this->telegram->sendMessage($targetChatId, $ok
+                ? "✅ Audit #{$session['id']} {$labels[$action]}."
+                : "❌ Audit holatini o'zgartirib bo'lmadi.");
+            return ['status' => $ok ? 'audit_state_changed' : 'error', 'action' => $action];
+        }
+
+        if ($action === 'status') {
+            $statusMsg = "⚙️ <b>Bot Tizim Holati</b>\n"
+                . "• Webhook: Faol ✅\n"
+                . "• Baza ulanishi: Barqaror ✅\n"
+                . "• AI Rejimi: <b>" . SettingsService::get($chatId)['ai_mode'] . "</b>\n"
+                . "• PHP versiyasi: " . PHP_VERSION . "\n"
+                . "• Vaqt zonasi: " . Config::get('APP_TIMEZONE', 'Asia/Tashkent');
+            $this->telegram->sendMessage($targetChatId, $statusMsg);
+            return ['status' => 'private_admin_action', 'action' => $action];
+        }
+
         return ['status' => 'ignored'];
     }
 
@@ -1225,18 +1148,24 @@ class UpdateRouter
     private function helpText(): string
     {
         return "❓ <b>Block-BOT — yordam</b>\n\n"
-            . "<b>Guruhда (faqat admin):</b>\n"
-            . "/settings — moderatsiya sozlamalari menyusi\n"
+            . "<b>Guruhда (faqat admin, faqat quyidagilar):</b>\n"
+            . "Botni keraksiz xabar bilan to'ldirmaslik uchun guruhda FAQAT xabarga \"reply\" "
+            . "qilib beriladigan to'g'ridan-to'g'ri moderatsiya buyruqlari ishlaydi:\n"
+            . "/warn /mute [soat] /ban — xabarga reply qilib jazo berish\n"
+            . "/unmute /unban /resetwarns /warnings — cheklovni yechish/ko'rish\n\n"
+            . "<b>Shaxsiy chatда (barcha boshqa buyruqlar shu yerda):</b>\n"
+            . "/menu — bosh menyu\n"
+            . "/mygroups — guruhlaringiz ro'yxati va sozlamalari\n"
+            . "/settings — moderatsiya sozlamalari menyusi (yoki /mygroups orqali)\n"
             . "/status — bot holati\n"
             . "/stats — 30 kunlik statistika\n"
+            . "/ai_usage — AI xarajatlari va budjet sarfi\n"
             . "/scan_members — a'zolarni 18+ / bot akkauntlarga tekshirish\n"
-            . "/audit — eski xabarlar tarixini tahlil qilish\n"
-            . "/warn /mute [soat] /ban — xabarga reply qilib jazo berish\n"
-            . "/unmute /unban /resetwarns — cheklovni yechish\n"
-            . "/blockword, /allowword, /unblockword, /wordlist — jargon/lahjadagi maxsus so'zlarni boshqarish\n\n"
-            . "<b>Shaxsiy chatда:</b>\n"
-            . "/menu — bosh menyu\n"
-            . "/mygroups — guruhlaringiz ro'yxati\n"
+            . "/audit [mtproto|json] — eski xabarlar tarixini tahlil qilish\n"
+            . "/audit_status /audit_pause /audit_resume /audit_cancel /audit_report — audit boshqaruvi\n"
+            . "/blockword, /allowword, /unblockword guruh_id so'z — jargon/lahjadagi maxsus so'zlarni boshqarish\n"
+            . "/wordlist [guruh_id] — maxsus so'z qoidalari ro'yxati\n"
+            . "<i>(Bir nechta guruhni boshqarsangiz, guruh ID'ni buyruqdan oldin ko'rsating — /mygroups orqali ko'rish mumkin)</i>\n"
             . "/appeal ID — cheklovga shikoyat\n\n"
             . "<b>Eski xabarlar auditi qanday ishlaydi?</b>\n"
             . "Telegram Bot API bot qo'shilishidan oldingi xabarlarni o'qiy olmaydi. Shuning uchun: "
@@ -1377,12 +1306,59 @@ class UpdateRouter
             return $result;
         }
 
-        if (preg_match('/^\/(ai_usage|stats|audit_status|audit_report|audit|scan_members)(?:@\w+)?(?:\s+(json|mtproto))?$/i', $text, $match)) {
+        if (preg_match('/^\/(ai_usage|stats|status|audit_status|audit_report|audit_pause|audit_resume|audit_cancel|audit|scan_members)(?:@\w+)?(?:\s+(json|mtproto))?$/i', $text, $match)) {
             $command = strtolower($match[1]);
             if ($command === 'audit') {
                 $command = strtolower((string)($match[2] ?? 'json')) === 'mtproto' ? 'audit_mtproto' : 'audit_json';
             }
             return $this->sendPrivateCommandGroupPicker($userId, $command);
+        }
+
+        // /blockword, /allowword, /unblockword — guruh maxsus so'z qoidalarini shaxsiy chatdan boshqarish.
+        if (preg_match('/^\/(blockword|allowword|unblockword)(?:@\w+)?(?:\s+(.*))?$/is', $text, $match)) {
+            $cmd = '/' . strtolower($match[1]);
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[2] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous' || $resolved['rest'] === '') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz (yoki so'z ko'rsatilmadi). Foydalanish:\n"
+                    . "<code>{$cmd} -100... so'z_yoki_ibora</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            $fakeParts = [$cmd, $resolved['rest']];
+            return $this->handleWordRuleCommand($cmd, "{$cmd} {$resolved['rest']}", $fakeParts, $resolved['chat_id'], $userId);
+        }
+
+        // /wordlist — guruhning maxsus so'z qoidalari ro'yxatini shaxsiy chatda ko'rsatish.
+        if (preg_match('/^\/wordlist(?:@\w+)?(?:\s+(.*))?$/i', $text, $match)) {
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[1] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/wordlist -100...</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            return $this->handleWordListCommand($resolved['chat_id'], $userId);
         }
 
         // Agar /start settings_-100... deb kelgan bo'lsa:
