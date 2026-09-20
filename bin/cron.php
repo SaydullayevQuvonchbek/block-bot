@@ -6,10 +6,16 @@ require_once dirname(__DIR__) . '/vendor/autoload.php';
 
 use App\Core\Config;
 use App\Core\Database;
+use App\Core\HealthCheck;
 use App\Core\Logger;
 use App\Core\QueueService;
 
 Config::load();
+
+// Salomatlik tekshiruvi (bin/healthcheck.php, public/healthz.php) shu belgi orqali
+// cron'ning "jonligini" biladi — worker.php o'rniga cron.php ishlatilayotgan
+// (shared hosting) o'rnatishlarda ham har chaqiriqda yangilanadi.
+HealthCheck::writeHeartbeat();
 
 $startTime = microtime(true);
 $maxRunTime = 55; // Cron har daqiqada takrorlanganda bir-biriga xalaqit bermasligi uchun 55 soniya

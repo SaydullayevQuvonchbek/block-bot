@@ -2,6 +2,7 @@
 /.idea/
 /.vscode/
 /storage/logs/*.log
+/storage/logs/*.log.*
 /storage/temp/*
 /storage/sessions/*
 !/storage/logs/.gitkeep
@@ -12,4 +13,5 @@ composer.phar
 *.session
 *.session.lock
 /Claude outputs/
+BLOCKBOT_2.0_TAHLIL.md
 

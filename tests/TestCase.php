@@ -40,6 +40,9 @@ abstract class TestCase
             self::$testPdo->exec("DELETE FROM moderation_appeals");
             self::$testPdo->exec("DELETE FROM word_rules");
             self::$testPdo->exec("DELETE FROM domain_rules");
+            self::$testPdo->exec("DELETE FROM flood_counters");
+            self::$testPdo->exec("DELETE FROM captcha_pending");
+            self::$testPdo->exec("DELETE FROM star_payments");
         }
     }
 

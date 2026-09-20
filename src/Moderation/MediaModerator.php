@@ -177,6 +177,7 @@ class MediaModerator
                 'video', 'animation' => $this->inspectVideo($localTempPath, $caption, $chatId, $itemId, $customModel),
                 'sticker' => $this->inspectSticker($localTempPath, $extension, $chatId, $itemId),
                 'document' => $this->inspectDocument($localTempPath, $caption, $chatId, $itemId),
+                'voice', 'audio' => $this->inspectVoice($localTempPath, $caption, $chatId, $itemId, $customModel),
                 default => [
                     'status' => 'unscannable',
                     'category' => 'unsupported_media_type',
@@ -301,7 +302,20 @@ class MediaModerator
             return $this->inspectPhoto($path, 'Sticker', $chatId, $itemId);
         }
 
-        // TGS (Lottie) yoki WEBM video stikerlar
+        if ($ext === 'webm') {
+            // WEBM video-stiker — oddiy video bilan bir xil FFmpeg kadr-ajratish
+            // logikasi qayta ishlatiladi (video sifatida tekshiriladi). FFmpeg mavjud
+            // bo'lmagan holat odatda ModerateMessageJob darajasida thumbnail-zaxira
+            // bilan oldindan hal qilinadi; bu yerga to'g'ridan-to'g'ri yetib kelsa ham
+            // inspectVideo() o'zi mos "ffmpeg_missing" natijasini qaytaradi.
+            $result = $this->inspectVideo($path, 'Video-stiker', $chatId, $itemId);
+            $result['source'] = $result['source'] === 'ai_vision_video' ? 'ai_vision_video_sticker' : $result['source'];
+            return $result;
+        }
+
+        // TGS (Lottie) — FFmpeg orqali dekodlab bo'lmaydi. ModerateMessageJob darajasida
+        // Telegram taqdim etadigan statik muqova (thumbnail) orqali tekshiriladi; bu yerga
+        // to'g'ridan-to'g'ri yetib kelsa (masalan, muqova yo'q holatda), unscannable qaytariladi.
         return [
             'status' => 'unscannable',
             'category' => 'animated_sticker',
@@ -310,6 +324,20 @@ class MediaModerator
             'source' => 'media_moderator',
             'frames_scanned' => 0,
         ];
+    }
+
+    /**
+     * Ovozli xabar (voice, OGG/Opus) yoki audio fayl (audio, mp3/m4a va h.k.) tahlili.
+     * SafeSearch zaxira mexanizmi (rasm-asosli) bu yerda qo'llanilmaydi — faqat AI
+     * klientning (Gemini: native, OpenRouter: "unscannable" bilan gracious degradatsiya)
+     * javobi ishlatiladi.
+     */
+    private function inspectVoice(string $path, string $caption, ?int $chatId, string $itemId, ?string $customModel = null): array
+    {
+        $res = $this->openRouter->moderateAudio($path, $caption, $itemId, $chatId, $customModel);
+        $res['frames_scanned'] = 0;
+        $res['source'] = $res['source'] ?? 'ai_audio';
+        return $res;
     }
 
     private function inspectDocument(string $path, string $caption, ?int $chatId, string $itemId): array

@@ -49,7 +49,7 @@ try {
         : "CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(191) PRIMARY KEY, applied_at DATETIME NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
     if ($driver === 'sqlite' || $env === 'test') {
-        $version = 'sqlite_schema_v3';
+        $version = 'sqlite_schema_v8';
         $check = $pdo->prepare("SELECT COUNT(*) FROM schema_migrations WHERE version = :version");
         $check->execute(['version' => $version]);
         if ((int)$check->fetchColumn() === 0) {

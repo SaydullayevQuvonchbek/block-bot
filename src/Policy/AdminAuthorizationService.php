@@ -110,6 +110,98 @@ class AdminAuthorizationService
     }
 
     /**
+     * Foydalanuvchi ADMIN yoki EGASI bo'lgan barcha faol guruhlar ro'yxati.
+     * Platforma egasi (`TELEGRAM_OWNER_IDS`) uchun — barcha faol guruhlar.
+     * `UpdateRouter::adminGroupsOf()` (shaxsiy DM buyruqlari) va Mini App
+     * REST API (`MiniAppApiRouter::me()`) ikkalasi ham shu YAGONA joydan
+     * foydalanadi — dublikat SQL yo'q (2.0 Phase 3, 3-band).
+     *
+     * @return array<int, array{chat_id: int|string, title: ?string}>
+     */
+    public static function adminGroupsOfUser(int $userId): array
+    {
+        $pdo = Database::getConnection();
+        if ($userId > 0 && in_array($userId, AdminNotificationService::ownerIds(), true)) {
+            $stmt = $pdo->prepare("SELECT chat_id, title FROM `groups` WHERE is_active = 1 ORDER BY updated_at DESC");
+            $stmt->execute();
+        } else {
+            $stmt = $pdo->prepare("
+                SELECT c.chat_id, g.title
+                FROM chat_members c
+                LEFT JOIN `groups` g ON g.chat_id = c.chat_id
+                WHERE c.user_id = :uid AND c.role IN ('creator', 'administrator')
+                  AND (g.is_active = 1 OR g.is_active IS NULL)
+                ORDER BY g.updated_at DESC
+            ");
+            $stmt->execute(['uid' => $userId]);
+        }
+        return $stmt->fetchAll() ?: [];
+    }
+
+    /**
+     * Botning ICHKI "moderator" roli — Telegram'ning o'z admin/creator statusidan
+     * mustaqil, faqat botning cheklangan huquqli buyruqlariga (masalan /warn, /mute)
+     * ruxsat beradigan, admin tomonidan qo'lda belgilanadigan rol (`chat_members.bot_role`).
+     * Bu ustun `isAdmin()`ning Telegram-sinxronizatsiyasiga umuman aloqador emas.
+     */
+    public function isModerator(int|string $chatId, int $userId): bool
+    {
+        $chatId = (int)$chatId;
+        if ($userId <= 0) {
+            return false;
+        }
+        try {
+            $stmt = Database::getConnection()->prepare("
+                SELECT bot_role FROM chat_members WHERE chat_id = :cid AND user_id = :uid
+            ");
+            $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+            return (string)($stmt->fetchColumn() ?: 'none') === 'moderator';
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    /**
+     * To'liq admin (creator/administrator/bot egasi) YOKI botning ichki moderator
+     * roliga ega foydalanuvchi uchun true qaytaradi. Moderator kengaytmagan
+     * (cheklangan) buyruqlar to'plamiga ruxsat berish uchun ishlatiladi — chaqiruvchi
+     * darajada aynan qaysi buyruq ruxsat etilganini alohida tekshirishi kerak.
+     */
+    public function hasModeratorPrivileges(int|string $chatId, int $userId, ?array $senderChat = null): bool
+    {
+        return $this->isAdmin($chatId, $userId, $senderChat) || $this->isModerator($chatId, $userId);
+    }
+
+    /**
+     * Guruh admini tomonidan boshqa a'zoga botning ichki "moderator" rolini
+     * belgilash/bekor qilish. `chat_members` qatori hali mavjud bo'lmasa (masalan,
+     * foydalanuvchi hali hech qachon sinxronlanmagan), xavfsiz standart qiymatlar
+     * bilan yangi qator yaratiladi — `role` keyinchalik `isAdmin()` sinxronizatsiyasi
+     * orqali to'g'irlanadi.
+     */
+    public static function setModeratorRole(int $chatId, int $userId, bool $isModerator): void
+    {
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        $botRole = $isModerator ? 'moderator' : 'none';
+
+        if ($pdo->getAttribute(\PDO::ATTR_DRIVER_NAME) === 'sqlite') {
+            $stmt = $pdo->prepare("
+                INSERT INTO chat_members (chat_id, user_id, role, bot_role, updated_at)
+                VALUES (:cid, :uid, 'member', :br, :now)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET bot_role = excluded.bot_role, updated_at = excluded.updated_at
+            ");
+        } else {
+            $stmt = $pdo->prepare("
+                INSERT INTO chat_members (chat_id, user_id, role, bot_role, updated_at)
+                VALUES (:cid, :uid, 'member', :br, :now)
+                ON DUPLICATE KEY UPDATE bot_role = VALUES(bot_role), updated_at = VALUES(updated_at)
+            ");
+        }
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId, 'br' => $botRole, 'now' => $now]);
+    }
+
+    /**
      * Foydalanuvchi oq ro'yxatda (whitelist) bor-yo'qligini tekshirish
      */
     public function isWhitelisted(int|string $chatId, int $userId): bool

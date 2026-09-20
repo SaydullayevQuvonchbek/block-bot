@@ -6,6 +6,7 @@ namespace App\AI;
 
 use App\Core\Config;
 use App\Core\Logger;
+use App\Policy\SubscriptionService;
 
 /**
  * Google Gemini REST API klienti.
@@ -20,6 +21,7 @@ class GeminiClient extends OpenRouterClient
     private string $geminiBaseUrl;
     private string $geminiTextModel;
     private string $geminiVisionModel;
+    private string $geminiAudioModel;
     // $proxySecret — OpenRouterClient'dan meros (protected), shu yerda qayta e'lon qilinmaydi.
 
     public function __construct()
@@ -31,6 +33,12 @@ class GeminiClient extends OpenRouterClient
         ), '/');
         $this->geminiTextModel = $this->normalizeModel((string)Config::get('GEMINI_TEXT_MODEL', 'gemini-2.5-flash'));
         $this->geminiVisionModel = $this->normalizeModel((string)Config::get('GEMINI_VISION_MODEL', 'gemini-2.5-flash'));
+        // Alohida sozlanmasa, vision modeli bilan bir xil ishlatiladi (Gemini 2.5 Flash
+        // audio kiritishni ham native qo'llab-quvvatlaydi, yangi majburiy .env o'zgaruvchisi shart emas).
+        $this->geminiAudioModel = $this->normalizeModel((string)Config::get(
+            'GEMINI_AUDIO_MODEL',
+            (string)Config::get('GEMINI_VISION_MODEL', 'gemini-2.5-flash')
+        ));
         // Google ba'zi mamlakatlar (masalan Rossiya/Belarus) IP manzillaridan kelgan so'rovlarni
         // "User location is not supported" xatosi bilan rad etadi. GEMINI_BASE_URL'ni
         // Cloudflare Worker proksisiga (deploy/cloudflare-worker/telegram-proxy.js, /gemini yo'li)
@@ -150,6 +158,73 @@ class GeminiClient extends OpenRouterClient
         );
     }
 
+    /**
+     * Ovozli/audio xabarni (Telegram voice — OGG/Opus, yoki audio — MP3/M4A va h.k.)
+     * Gemini'ning native audio kiritish qo'llab-quvvatlashi orqali moderatsiya qilish.
+     * Qayta kodlash (transcoding) talab qilinmaydi — fayl to'g'ridan-to'g'ri inline_data
+     * sifatida yuboriladi (rasm bilan bir xil mexanizm).
+     */
+    public function moderateAudio(
+        string $audioPath,
+        string $caption = '',
+        string $itemId = 'item_1',
+        ?int $chatId = null,
+        ?string $customModel = null
+    ): array {
+        if (!$this->isConfigured()) {
+            return $this->configurationError($itemId);
+        }
+
+        if (!is_file($audioPath) || !is_readable($audioPath)) {
+            return [
+                'item_id' => $itemId,
+                'status' => 'unscannable',
+                'category' => 'error',
+                'reason' => "Audio fayli serverda topilmadi",
+                'evidence' => '',
+                'model' => 'none',
+                'cost_usd' => 0.0,
+            ];
+        }
+
+        $mime = mime_content_type($audioPath) ?: 'audio/ogg';
+        $audioData = file_get_contents($audioPath);
+
+        if ($audioData === false || $audioData === '') {
+            return [
+                'item_id' => $itemId,
+                'status' => 'unscannable',
+                'category' => 'error',
+                'reason' => "Audio faylni o'qib bo'lmadi",
+                'evidence' => '',
+                'model' => 'none',
+                'cost_usd' => 0.0,
+            ];
+        }
+
+        $prompt = $caption !== ''
+            ? "item_id: {$itemId}\nUshbu ovozli xabarni tinglab, undagi nutqni (va fon ovozini) moderatsiya qil. Izoh: {$caption}"
+            : "item_id: {$itemId}\nUshbu ovozli xabarni tinglab, undagi nutqni moderatsiya qil.";
+
+        $parts = [
+            ['text' => $prompt],
+            [
+                'inline_data' => [
+                    'mime_type' => $mime,
+                    'data' => base64_encode($audioData),
+                ],
+            ],
+        ];
+
+        return $this->callGemini(
+            $parts,
+            $this->normalizeModel($customModel ?: $this->geminiAudioModel),
+            'audio',
+            $itemId,
+            $chatId
+        );
+    }
+
     private function callGemini(
         array $parts,
         string $model,
@@ -157,7 +232,25 @@ class GeminiClient extends OpenRouterClient
         string $itemId,
         ?int $chatId
     ): array {
-        $estimatedCost = $requestType === 'vision' ? 0.002 : 0.0005;
+        // Bepul tarif kunlik AI so'rov chegarasi (2.0 Phase 3, 2-band — monetizatsiya).
+        // Premium guruhlar uchun har doim o'tadi. Global $ budjet tekshiruvidan (pastda)
+        // ATAYLAB ALOHIDA — bu GURUH darajasidagi (per-chat) chegara.
+        if ($chatId !== null && !SubscriptionService::canUseAi($chatId)) {
+            return [
+                'item_id' => $itemId,
+                'status' => 'review',
+                'category' => 'free_tier_limit_reached',
+                'reason' => "Bepul tarifning kunlik AI so'rov chegarasiga yetdi",
+                'evidence' => '',
+                'model' => 'none',
+                'cost_usd' => 0.0,
+            ];
+        }
+
+        $estimatedCost = match ($requestType) {
+            'vision', 'audio' => 0.002,
+            default => 0.0005,
+        };
         $reservationKey = UsageBudgetService::reserveBudget($estimatedCost);
         if ($reservationKey === null) {
             return [

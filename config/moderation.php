@@ -27,6 +27,23 @@ return [
         'unscannable_action' => 'leave_alert',
         // Tarixiy audit topilmalarini admin tugma orqali tozalashi mumkinmi.
         'history_cleanup_enabled' => true,
+        // Anti-flood / spam-portlash himoyasi (2.0 Phase 1): "flood_window_sec" soniya
+        // ichida bitta foydalanuvchidan "flood_max_messages" tadan ortiq xabar kelsa,
+        // "flood_mute_duration_sec" davomida avtomatik mute qo'llanadi. Haqiqiy standart
+        // qiymatlar `SettingsService::get()`da (har bir guruh uchun DB'da) saqlanadi —
+        // bu yerdagilar faqat hujjat/ma'lumot uchun.
+        'flood_enabled' => true,
+        'flood_max_messages' => 6,
+        'flood_window_sec' => 10,
+        'flood_mute_duration_sec' => 600,
+        // Yangi a'zolar uchun CAPTCHA/tasdiqlash (2.0 Phase 1): yoqilgan bo'lsa, yangi
+        // qo'shilgan a'zo "captcha_timeout_sec" soniya ichida "✅ Men botman emas" tugmasini
+        // bosmaguncha guruhda yoza olmaydi (can_send_messages=false); vaqtida bosmasa —
+        // guruhdan chetlatiladi (kick, doimiy ban emas). Standart holatda O'CHIRILGAN —
+        // admin `/settings` menyusidan yoqishi kerak (yangi a'zolar tajribasiga ta'sir
+        // qiladigan ixtiyoriy sozlama). Haqiqiy qiymatlar `SettingsService::get()`da saqlanadi.
+        'captcha_enabled' => false,
+        'captcha_timeout_sec' => 60,
     ],
 
     'ai' => [

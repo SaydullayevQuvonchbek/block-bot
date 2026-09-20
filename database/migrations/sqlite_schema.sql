@@ -30,6 +30,19 @@ CREATE TABLE IF NOT EXISTS group_settings (
     history_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
     log_chat_id INTEGER NULL,
     custom_rules_json TEXT NULL,
+    flood_enabled INTEGER NOT NULL DEFAULT 1,
+    flood_max_messages INTEGER NOT NULL DEFAULT 6,
+    flood_window_sec INTEGER NOT NULL DEFAULT 10,
+    flood_mute_duration_sec INTEGER NOT NULL DEFAULT 600,
+    captcha_enabled INTEGER NOT NULL DEFAULT 0,
+    captcha_timeout_sec INTEGER NOT NULL DEFAULT 60,
+    -- Guruhga ko'rinadigan xabarlar (CAPTCHA, ogohlantirish/mute/ban) tili:
+    -- 'uz' (standart), 'ru', 'en'. Admin panel/DM buyruqlari hozircha o'zbekcha
+    -- qoladi (2.0 Phase 3, 1-band — i18n, bosqichma-bosqich).
+    language TEXT NOT NULL DEFAULT 'uz',
+    -- NULL = bepul tarif. Muddat o'tgan bo'lsa ham avtomatik bepulga tushadi
+    -- (App\Policy\SubscriptionService "lazy" tekshiradi) — 2.0 Phase 3, 2-band.
+    premium_expires_at TEXT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -50,6 +63,10 @@ CREATE TABLE IF NOT EXISTS chat_members (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     role TEXT NOT NULL DEFAULT 'member',
+    -- Telegram'ning o'zi sinxronlaydigan `role`dan ataylab alohida: botning ichki,
+    -- cheklangan huquqli "moderator" roli ('none' | 'moderator'). Telegram sinxronizatsiyasi
+    -- bu ustunga hech qachon tegmaydi (AdminAuthorizationService::isAdmin()ga qarang).
+    bot_role TEXT NOT NULL DEFAULT 'none',
     is_admin_exempt INTEGER NOT NULL DEFAULT 0,
     is_whitelisted INTEGER NOT NULL DEFAULT 0,
     mute_until TEXT NULL,
@@ -232,6 +249,28 @@ CREATE TABLE IF NOT EXISTS audit_items (
     FOREIGN KEY (audit_session_id) REFERENCES audit_sessions (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS flood_counters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    window_start TEXT NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    UNIQUE (chat_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS captcha_pending (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (chat_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS moderation_appeals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action_id INTEGER NOT NULL UNIQUE,
@@ -244,4 +283,18 @@ CREATE TABLE IF NOT EXISTS moderation_appeals (
     reviewed_by INTEGER NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- Har bir muvaffaqiyatli Telegram Stars to'lovi (2.0 Phase 3, 2-band —
+-- monetizatsiya). UNIQUE(telegram_payment_charge_id) — Telegram webhookni
+-- qayta yuborsa ham premium muddati ikki marta uzaytirilmasligi uchun.
+CREATE TABLE IF NOT EXISTS star_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    telegram_payment_charge_id TEXT NOT NULL UNIQUE,
+    stars_amount INTEGER NOT NULL,
+    days_granted INTEGER NOT NULL,
+    invoice_payload TEXT NULL,
+    created_at TEXT NOT NULL
 );

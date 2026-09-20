@@ -12,10 +12,14 @@ use App\Core\Database;
 use App\Core\Logger;
 use App\Core\QueueService;
 use App\Core\TelegramClient;
+use App\Core\Translator;
 use App\Policy\AdminAuthorizationService;
 use App\Policy\AdminNotificationService;
 use App\Policy\PunishmentService;
 use App\Policy\SettingsService;
+use App\Policy\SubscriptionService;
+use App\Moderation\CaptchaGuard;
+use App\Moderation\FloodGuard;
 use App\Moderation\TextModerator;
 use Throwable;
 
@@ -71,6 +75,12 @@ class UpdateRouter
 
             if (isset($update['callback_query'])) {
                 return $this->handleCallbackQuery($update['callback_query']);
+            }
+
+            // Telegram Stars to'lovi (2.0 Phase 3, 2-band): pre_checkout_query'ga 10
+            // soniya ichida javob berilishi SHART, shuning uchun sinxron ishlanadi.
+            if (isset($update['pre_checkout_query'])) {
+                return $this->handlePreCheckoutQuery($update['pre_checkout_query']);
             }
 
             if (isset($update['my_chat_member'])) {
@@ -146,6 +156,14 @@ class UpdateRouter
                     continue;
                 }
                 $isBotMember = (bool)($newMember['is_bot'] ?? false);
+
+                // --- CAPTCHA: bot bo'lmagan yangi a'zoni vaqtincha cheklash ---
+                // Bot akkauntlar bu yerdan o'tkazilmaydi — ular allaqachon mavjud bot_filter/
+                // ScanProfileJob mexanizmi orqali alohida ko'rib chiqiladi.
+                if (!$isBotMember && $newMemberId > 0 && (bool)($settings['captcha_enabled'] ?? false)) {
+                    $this->startCaptcha($chatId, $newMemberId, $newMember, $settings, $this->threadIdFrom($message));
+                }
+
                 $shouldScan = $isBotMember
                     ? (bool)($settings['bot_filter'] ?? true)
                     : (bool)($settings['profile_scan'] ?? true);
@@ -187,13 +205,13 @@ class UpdateRouter
         // GURUHDA FAQAT TO'G'RIDAN-TO'G'RI MODERATSIYA BUYRUQLARI ISHLAYDI: admin botni
         // asosan shaxsiy chatda (DM) boshqaradi (/menu, /settings, /stats, /blockword va
         // h.k. — o'sha yerda ishlaydi). Istisno — /warn, /mute, /ban, /unmute, /unban,
-        // /resetwarns, /warnings: bular ma'lum bir xabarga "reply" qilib berilgani uchun
-        // shaxsiy chatga ko'chirib bo'lmaydi, shu bois guruhda qoldirilgan (o'zi hech
-        // qanday keraksiz "menyu" xabari chiqarmaydi — faqat amal natijasini yozadi).
-        // Qolgan barcha "/..." matni pastdagi oddiy moderatsiyadan o'tishda davom etadi.
-        // Avtomatik ogohlantirish/jazo (warn/mute/ban) xabarlari ModerateMessageJob/
-        // PunishmentService orqali ishlaydi va bunga umuman ta'sir qilmaydi.
-        static $groupAllowedCommands = ['/warn', '/mute', '/ban', '/unmute', '/unban', '/resetwarns', '/warnings'];
+        // /resetwarns, /warnings, /addmod, /removemod: bular ma'lum bir xabarga "reply"
+        // qilib berilgani uchun shaxsiy chatga ko'chirib bo'lmaydi, shu bois guruhda
+        // qoldirilgan (o'zi hech qanday keraksiz "menyu" xabari chiqarmaydi — faqat amal
+        // natijasini yozadi). Qolgan barcha "/..." matni pastdagi oddiy moderatsiyadan
+        // o'tishda davom etadi. Avtomatik ogohlantirish/jazo (warn/mute/ban) xabarlari
+        // ModerateMessageJob/PunishmentService orqali ishlaydi va bunga umuman ta'sir qilmaydi.
+        static $groupAllowedCommands = ['/warn', '/mute', '/ban', '/unmute', '/unban', '/resetwarns', '/warnings', '/addmod', '/removemod'];
         if (str_starts_with($rawText, '/')) {
             $cmdOnly = strtolower(explode('@', explode(' ', trim($rawText))[0])[0]);
             if (in_array($cmdOnly, $groupAllowedCommands, true)) {
@@ -223,6 +241,40 @@ class UpdateRouter
                     || !empty($message['sticker']),
             ], 'moderation');
             return ['status' => 'skipped', 'reason' => $isAdmin ? 'Admin xabari' : 'Oq ro\'yxat'];
+        }
+
+        // --- 2.5. Anti-flood / spam-portlash himoyasi ---
+        // AI yoki matn/media tahlilidan mustaqil, sof deterministik tezlik nazorati:
+        // belgilangan oyna (masalan 10 soniya) ichida ruxsat etilganidan ortiq xabar
+        // yuborgan a'zo darhol (qisqa muddatga) mute qilinadi. Bu bosqich content
+        // moderatsiyasidan OLDIN ishlaydi — flood holatida xabar mazmuni tekshirilmaydi,
+        // chunki muammo aynan "juda tez-tez yozish"ning o'zi.
+        if ($userId > 0 && (bool)($settings['flood_enabled'] ?? true)) {
+            $floodWindowSec = max(1, (int)($settings['flood_window_sec'] ?? 10));
+            $floodMaxMessages = max(1, (int)($settings['flood_max_messages'] ?? 6));
+            $floodResult = FloodGuard::register($chatId, $userId, $floodWindowSec, $floodMaxMessages);
+
+            if ($floodResult['flooding']) {
+                $floodMuteDuration = max(30, (int)($settings['flood_mute_duration_sec'] ?? 600));
+                $decision = [
+                    'action' => 'mute_user',
+                    'delete_message' => false,
+                    'mute_duration_sec' => $floodMuteDuration,
+                    'reason' => "Flood/spam-portlash: {$floodWindowSec} soniyada {$floodResult['count']} tadan ortiq xabar yuborildi",
+                    'evidence' => "xabarlar soni: {$floodResult['count']}, oyna: {$floodWindowSec}s",
+                    // strike_count = 99: bu oddiy ogohlantirish zinapoyasiga (warn->mute->ban)
+                    // qo'shilmaydi — flood mustaqil, alohida turdagi qoidabuzarlik.
+                    'strike_count' => 99,
+                ];
+                $this->punishment->execute($chatId, $userId, $messageId, $decision);
+                Logger::info("Flood aniqlandi, foydalanuvchi vaqtincha cheklandi", [
+                    'chat_id' => $chatId,
+                    'user_id' => $userId,
+                    'message_count' => $floodResult['count'],
+                    'window_sec' => $floodWindowSec,
+                ], 'moderation');
+                return ['status' => 'flood_muted', 'message_count' => $floodResult['count']];
+            }
         }
 
         if ($userId > 0) {
@@ -271,6 +323,97 @@ class UpdateRouter
     }
 
     /**
+     * Forum (Topics) rejimidagi superguruhda xabar qaysi mavzuga tegishli ekanini
+     * aniqlaydi (2.0 Phase 4 — forum-topics qo'llab-quvvatlashi). Telegram FAQAT
+     * nomlangan mavzu ichidagi xabarlarga `is_topic_message: true` +
+     * `message_thread_id` qo'yadi — "General" mavzusida yoki oddiy (forum bo'lmagan)
+     * guruhda bu maydonlar umuman kelmaydi. Shu sababli `null` qaytarilganda
+     * `sendMessage()`ga `message_thread_id` UMUMAN yuborilmaydi — aks holda Telegram
+     * "message thread not found" xatosi bilan rad etadi.
+     */
+    private function threadIdFrom(array $message): ?int
+    {
+        if (empty($message['is_topic_message']) || !isset($message['message_thread_id'])) {
+            return null;
+        }
+        $threadId = (int)$message['message_thread_id'];
+        return $threadId > 0 ? $threadId : null;
+    }
+
+    /**
+     * `threadIdFrom()`ning qulay shakli — to'g'ridan-to'g'ri `sendMessage()`ning
+     * `$extra` massiviga (yoki mavjud `$extra`ga `array_merge` orqali) qo'shish uchun.
+     * Mavzu topilmasa bo'sh massiv qaytadi — hech narsa o'zgarmaydi.
+     *
+     * @return array{message_thread_id?: int}
+     */
+    private function threadExtra(array $message): array
+    {
+        $threadId = $this->threadIdFrom($message);
+        return $threadId !== null ? ['message_thread_id' => $threadId] : [];
+    }
+
+    /**
+     * Yangi a'zoni CAPTCHA oqimiga qo'yish: xabar yozish huquqini vaqtincha
+     * cheklaydi (mute), "✅ Men botman emas" tugmali xabar yuboradi va
+     * kechiktirilgan CaptchaTimeoutJob'ni navbatga qo'yadi (agar vaqtida
+     * tasdiqlanmasa — chetlatish uchun). `$messageThreadId` berilsa (forum
+     * guruhning nomlangan mavzusida qo'shilgan bo'lsa) — CAPTCHA xabari
+     * "General"ga emas, aynan o'sha mavzuga yuboriladi.
+     */
+    private function startCaptcha(int $chatId, int $userId, array $user, array $settings, ?int $messageThreadId = null): void
+    {
+        $timeoutSec = max(10, (int)($settings['captcha_timeout_sec'] ?? 60));
+
+        // Bir oz qo'shimcha bufer bilan cheklash — CaptchaTimeoutJob ishlashidan oldin
+        // Telegram tomonidan avtomatik ochilib ketmasligi uchun.
+        $restricted = $this->telegram->muteUser($chatId, $userId, $timeoutSec + 30);
+        if (!$restricted) {
+            // Bot cheklash huquqiga ega emas (admin emas yoki "Restrict members" huquqi
+            // berilmagan) — captcha oqimini boshlashning ma'nosi yo'q.
+            Logger::warning("CAPTCHA: foydalanuvchini cheklab bo'lmadi (bot huquqi yetarli emasmi?)", [
+                'chat_id' => $chatId,
+                'user_id' => $userId,
+            ], 'moderation');
+            return;
+        }
+
+        $name = trim((string)($user['first_name'] ?? '') . ' ' . (string)($user['last_name'] ?? ''));
+        $name = $name !== '' ? $name : 'Foydalanuvchi';
+        $safeName = htmlspecialchars($name, ENT_QUOTES, 'UTF-8');
+        $nameLink = "<a href=\"tg://user?id={$userId}\">{$safeName}</a>";
+
+        // Guruhga ko'rinadigan CAPTCHA matni guruhning tanlangan tilida
+        // (`group_settings.language`, standart 'uz') tuziladi — 2.0 Phase 3, 1-band (i18n).
+        $lang = Translator::normalizeLang($settings['language'] ?? null);
+        $text = Translator::get('captcha.welcome', $lang, ['name' => $nameLink, 'timeout' => $timeoutSec]);
+        $markup = ['inline_keyboard' => [[
+            ['text' => Translator::get('captcha.button', $lang), 'callback_data' => "captcha_verify:{$chatId}:{$userId}"],
+        ]]];
+
+        $extra = ['reply_markup' => $markup];
+        if ($messageThreadId !== null) {
+            $extra['message_thread_id'] = $messageThreadId;
+        }
+        $sent = $this->telegram->sendMessage($chatId, $text, $extra);
+        $messageId = (int)($sent['result']['message_id'] ?? 0);
+        if ($messageId === 0) {
+            Logger::warning("CAPTCHA: tasdiqlash xabarini yuborib bo'lmadi", [
+                'chat_id' => $chatId,
+                'user_id' => $userId,
+            ], 'moderation');
+            $this->telegram->unmuteUser($chatId, $userId);
+            return;
+        }
+
+        CaptchaGuard::start($chatId, $userId, $messageId, $timeoutSec);
+        QueueService::push('App\Jobs\CaptchaTimeoutJob', [
+            'chat_id' => $chatId,
+            'user_id' => $userId,
+        ], QueueService::PRIORITY_NORMAL, $timeoutSec + 5);
+    }
+
+    /**
      * DIQQAT: bu metod endi FAQAT guruhda qoladigan 7 ta to'g'ridan-to'g'ri moderatsiya
      * buyrug'i (/warn, /mute, /ban, /unmute, /unban, /resetwarns, /warnings) uchun
      * chaqiriladi — handleMessage() dagi $groupAllowedCommands ro'yxatiga qarang. Qolgan
@@ -287,8 +430,19 @@ class UpdateRouter
         $senderChat = $message['sender_chat'] ?? null;
 
         $isAdmin = $this->auth->isAdmin($chatId, $userId, $senderChat);
-        if (!$isAdmin) {
+        $isModerator = !$isAdmin && $this->auth->isModerator($chatId, $userId);
+        if (!$isAdmin && !$isModerator) {
             return null; // Oddiy a'zolarga guruhda ortiqcha xabar chiqarmaymiz
+        }
+
+        // Botning ichki "moderator" roli faqat cheklangan, qaytariladigan chora
+        // buyruqlariga ruxsat beradi — /ban, /unban, /resetwarns, /addmod, /removemod
+        // kabi og'irroq/qaytarib bo'lmaydigan yoki rol-boshqaruv buyruqlari faqat
+        // to'liq adminlarga (yoki guruh egasi/bot egasiga) qoladi.
+        static $moderatorAllowedCommands = ['/warn', '/mute', '/unmute', '/warnings'];
+        if ($isModerator && !in_array($cmd, $moderatorAllowedCommands, true)) {
+            $this->telegram->sendMessage($chatId, "⛔ Bu buyruq faqat guruh administratorlari uchun.", $this->threadExtra($message));
+            return ['status' => 'forbidden_for_moderator', 'cmd' => $cmd];
         }
 
         switch ($cmd) {
@@ -300,10 +454,14 @@ class UpdateRouter
             case '/resetwarns':
                 return $this->handleModerationCommand($cmd, $message, $parts, $chatId);
 
+            case '/addmod':
+            case '/removemod':
+                return $this->handleModeratorRoleCommand($cmd, $message, $parts, $chatId);
+
             case '/warnings':
                 $targetUserId = $this->resolveTargetUserId($message, $parts);
                 if ($targetUserId <= 0) {
-                    $this->telegram->sendMessage($chatId, "Ogohlantirishlarni ko'rish uchun foydalanuvchi xabariga reply qiling yoki ID kiriting.");
+                    $this->telegram->sendMessage($chatId, "Ogohlantirishlarni ko'rish uchun foydalanuvchi xabariga reply qiling yoki ID kiriting.", $this->threadExtra($message));
                     return ['status' => 'error', 'reason' => 'target_user_not_found'];
                 }
                 $pdo = Database::getConnection();
@@ -318,7 +476,7 @@ class UpdateRouter
                         $msg .= ($index + 1) . '. ' . htmlspecialchars((string)$row['reason'], ENT_QUOTES, 'UTF-8') . " (gacha: {$row['expires_at']})\n";
                     }
                 }
-                $this->telegram->sendMessage($chatId, $msg);
+                $this->telegram->sendMessage($chatId, $msg, $this->threadExtra($message));
                 return ['status' => 'command_executed', 'cmd' => $cmd];
         }
 
@@ -401,6 +559,405 @@ class UpdateRouter
     }
 
     /**
+     * /modlist — guruhga botning ichki "moderator" roli bilan tayinlangan
+     * a'zolar ro'yxatini shaxsiy chatda ko'rsatish.
+     */
+    private function handleModListCommand(int $chatId, int $replyChatId): array
+    {
+        $stmt = Database::getConnection()->prepare("
+            SELECT user_id, updated_at FROM chat_members
+            WHERE chat_id = :cid AND bot_role = 'moderator'
+            ORDER BY updated_at DESC LIMIT 50
+        ");
+        $stmt->execute(['cid' => $chatId]);
+        $rows = $stmt->fetchAll();
+
+        if (!$rows) {
+            $this->telegram->sendMessage($replyChatId,
+                "Bu guruhda hozircha botning ichki moderator roliga ega a'zo yo'q.\n"
+                . "Tayinlash uchun guruhda a'zoning xabariga reply qilib <code>/addmod</code> yozing (faqat adminlar).");
+            return ['status' => 'command_executed', 'cmd' => '/modlist'];
+        }
+
+        $msg = "🛡 <b>Botning ichki moderatorlari (" . count($rows) . ")</b>\n"
+            . "<i>(faqat /warn, /mute, /unmute, /warnings buyruqlariga ruxsat bor)</i>\n\n";
+        foreach ($rows as $row) {
+            $uid = (int)$row['user_id'];
+            $msg .= "• <a href=\"tg://user?id={$uid}\">{$uid}</a>\n";
+        }
+        $msg .= "\n<i>Bekor qilish: guruhda o'sha a'zoning xabariga reply qilib /removemod</i>";
+        $this->telegram->sendMessage($replyChatId, $msg);
+        return ['status' => 'command_executed', 'cmd' => '/modlist'];
+    }
+
+    /**
+     * /til — guruh a'zolariga ko'rinadigan xabarlar (CAPTCHA, ogohlantirish/mute/ban)
+     * qaysi tilda yuborilishini ko'rsatish (argumentsiz) yoki o'zgartirish
+     * (`/til uz|ru|en`). Admin panel/DM buyruqlarining o'zi bu bosqichda hali
+     * faqat o'zbek tilida qoladi (2.0 Phase 3, 1-band — i18n, bosqichma-bosqich).
+     */
+    private function handleLanguageCommand(int $chatId, string $arg, int $replyChatId): array
+    {
+        $arg = strtolower(trim($arg));
+        $current = Translator::normalizeLang(SettingsService::get($chatId)['language'] ?? null);
+        $optionsList = "<code>uz</code> — o'zbekcha\n<code>ru</code> — русский\n<code>en</code> — English";
+
+        if ($arg === '') {
+            $this->telegram->sendMessage($replyChatId,
+                "🌐 Joriy til: <code>{$current}</code>\n\n"
+                . "Guruh a'zolariga ko'rinadigan xabarlar (yangi a'zo CAPTCHA'si, ogohlantirish/mute/ban) shu tilda yuboriladi. "
+                . "Admin panel va buyruqlarning o'zi hozircha o'zbek tilida qoladi.\n\n"
+                . "O'zgartirish uchun: <code>/til uz</code>, <code>/til ru</code> yoki <code>/til en</code>\n\n"
+                . "Mavjud tillar:\n{$optionsList}");
+            return ['status' => 'command_executed', 'cmd' => '/til'];
+        }
+
+        if (!in_array($arg, Translator::SUPPORTED, true)) {
+            $this->telegram->sendMessage($replyChatId,
+                "❌ Noma'lum til kodi: <code>{$arg}</code>\n\nMavjud tillar:\n{$optionsList}");
+            return ['status' => 'invalid_language', 'cmd' => '/til'];
+        }
+
+        SettingsService::update($chatId, ['language' => $arg]);
+        $this->telegram->sendMessage($replyChatId,
+            "✅ Til <code>{$arg}</code>ga o'zgartirildi. Endi guruh a'zolariga yuboriladigan yangi xabarlar (CAPTCHA, ogohlantirish/mute/ban) shu tilda bo'ladi.");
+        return ['status' => 'command_executed', 'cmd' => '/til', 'language' => $arg];
+    }
+
+    /**
+     * /exportsettings — guruhning joriy (klonlanishi mumkin bo'lgan)
+     * sozlamalarini JSON ko'rinishida ko'rsatadi — boshqa guruhga
+     * `/importsettings` orqali qo'lda ko'chirish yoki zaxira sifatida
+     * saqlash uchun (2.0 Phase 4, 2-band).
+     */
+    private function handleExportSettingsCommand(int $chatId, int $replyChatId): array
+    {
+        $exported = SettingsService::exportSettings($chatId);
+        $json = json_encode($exported, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $title = $this->resolveGroupTitle($chatId, '');
+
+        $this->telegram->sendMessage($replyChatId,
+            "📤 <b>Sozlamalar eksporti</b> — {$title} (<code>{$chatId}</code>)\n\n"
+            . "<pre>{$json}</pre>\n\n"
+            . "Boshqa guruhga qo'llash uchun: <code>/importsettings maqsad_guruh_id &lt;yuqoridagi JSON&gt;</code>\n"
+            . "Yoki ikkala guruhni ham o'zingiz boshqarsangiz: <code>/clonesettings {$chatId} maqsad_guruh_id</code>",
+            ['disable_web_page_preview' => true]);
+        return ['status' => 'command_executed', 'cmd' => '/exportsettings', 'chat_id' => $chatId, 'exported' => $exported];
+    }
+
+    /**
+     * `/importsettings`ga berilgan xom (json_decode qilingan) massivni
+     * SettingsService::CLONEABLE_COLUMNS'ga qarshi tekshiradi — har bir
+     * qiymat turi/oralig'i/enum ro'yxati bo'yicha tasdiqlanadi, noto'g'ri
+     * yoki noma'lum kalitlar jim tashlab ketiladi (import hech qachon
+     * fatal xato bermaydi, faqat "qo'llangan"/"o'tkazib yuborilgan"
+     * ro'yxatini qaytaradi) — 2.0 Phase 4, 2-band.
+     *
+     * @return array{applied: array<string,mixed>, skipped: array<int,string>}
+     */
+    private function sanitizeSettingsImport(array $raw): array
+    {
+        $boolFields = [
+            'clean_service_messages', 'profanity_filter', 'porn_filter',
+            'link_filter', 'media_filter', 'profile_scan', 'bot_filter',
+            'history_cleanup_enabled', 'flood_enabled', 'captcha_enabled',
+        ];
+        $enumFields = [
+            'ai_mode' => ['comprehensive', 'economical'],
+            'unscannable_action' => ['leave_alert', 'delete_notify'],
+            'porn_action' => ['ban', 'mute', 'warn'],
+            'adult_account_action' => ['ban', 'notify', 'mute_notify'],
+            'language' => Translator::SUPPORTED,
+        ];
+        $intRangeFields = [
+            'warn_limit' => [1, 20],
+            'warn_duration_days' => [1, 365],
+            'mute_1st_duration_sec' => [60, 2592000],
+            'mute_2nd_duration_sec' => [60, 2592000],
+            'flood_max_messages' => [1, 100],
+            'flood_window_sec' => [1, 3600],
+            'flood_mute_duration_sec' => [30, 2592000],
+            'captcha_timeout_sec' => [10, 3600],
+        ];
+
+        $applied = [];
+        $skipped = [];
+
+        foreach ($raw as $key => $value) {
+            if (!is_string($key) || !in_array($key, SettingsService::CLONEABLE_COLUMNS, true)) {
+                $skipped[] = is_string($key) ? $key : (string)$key;
+                continue;
+            }
+
+            if (in_array($key, $boolFields, true)) {
+                if ($value === true || $value === 1 || $value === '1') {
+                    $applied[$key] = 1;
+                } elseif ($value === false || $value === 0 || $value === '0') {
+                    $applied[$key] = 0;
+                } else {
+                    $skipped[] = $key;
+                }
+                continue;
+            }
+
+            if (isset($enumFields[$key])) {
+                if (is_string($value) && in_array(strtolower($value), $enumFields[$key], true)) {
+                    $applied[$key] = strtolower($value);
+                } else {
+                    $skipped[] = $key;
+                }
+                continue;
+            }
+
+            if (isset($intRangeFields[$key])) {
+                [$min, $max] = $intRangeFields[$key];
+                if (is_numeric($value) && (int)$value >= $min && (int)$value <= $max) {
+                    $applied[$key] = (int)$value;
+                } else {
+                    $skipped[] = $key;
+                }
+                continue;
+            }
+
+            $skipped[] = $key;
+        }
+
+        return ['applied' => $applied, 'skipped' => $skipped];
+    }
+
+    /**
+     * /importsettings — foydalanuvchi tomonidan qo'lda kiritilgan (yoki
+     * `/exportsettings`dan nusxalangan) JSON'ni tekshirib, guruhga qo'llash
+     * (2.0 Phase 4, 2-band).
+     */
+    private function handleImportSettingsCommand(int $chatId, string $jsonText, int $replyChatId): array
+    {
+        $jsonText = trim($jsonText);
+        if ($jsonText === '') {
+            $this->telegram->sendMessage($replyChatId,
+                "Foydalanish: <code>/importsettings guruh_id {...JSON...}</code>\n\n"
+                . "JSON'ni oldin <code>/exportsettings</code> orqali olishingiz mumkin.");
+            return ['status' => 'error', 'reason' => 'empty_json'];
+        }
+
+        $decoded = json_decode($jsonText, true);
+        if (!is_array($decoded) || json_last_error() !== JSON_ERROR_NONE) {
+            $this->telegram->sendMessage($replyChatId, "❌ JSON noto'g'ri formatda. Iltimos, <code>/exportsettings</code> chiqargan matnni o'zgartirmasdan joylashtiring.");
+            return ['status' => 'error', 'reason' => 'invalid_json'];
+        }
+
+        $result = $this->sanitizeSettingsImport($decoded);
+        if ($result['applied'] === []) {
+            $this->telegram->sendMessage($replyChatId, "❌ Hech qanday tanish/to'g'ri sozlama topilmadi — hech narsa o'zgartirilmadi.");
+            return ['status' => 'error', 'reason' => 'nothing_applied'];
+        }
+
+        SettingsService::update($chatId, $result['applied']);
+        $appliedList = implode(', ', array_map(static fn (string $k): string => "<code>{$k}</code>", array_keys($result['applied'])));
+        $text = "✅ " . count($result['applied']) . " ta sozlama qo'llandi:\n{$appliedList}";
+        if ($result['skipped'] !== []) {
+            $skippedList = implode(', ', array_map(static fn (string $k): string => "<code>{$k}</code>", $result['skipped']));
+            $text .= "\n\n⚠️ O'tkazib yuborildi (noma'lum yoki noto'g'ri qiymat): {$skippedList}";
+        }
+        $this->telegram->sendMessage($replyChatId, $text);
+        return ['status' => 'command_executed', 'cmd' => '/importsettings', 'chat_id' => $chatId, 'applied' => $result['applied'], 'skipped' => $result['skipped']];
+    }
+
+    /**
+     * /clonesettings manba_guruh_id maqsad_guruh_id — bitta guruhning
+     * klonlanishi mumkin bo'lgan sozlamalarini boshqasiga to'g'ridan-to'g'ri
+     * (JSON qo'lda kiritilmasdan) nusxalash. Xavfsizlik uchun chaqiruvchi
+     * IKKALA guruhning ham (manba VA maqsad) admini bo'lishi shart — aks
+     * holda o'zi boshqarmagan guruhning sozlamalarini o'qib/yozib bo'lardi
+     * (2.0 Phase 4, 2-band).
+     */
+    private function handleCloneSettingsCommand(int $userId, int $sourceChatId, int $targetChatId, int $replyChatId): array
+    {
+        if ($sourceChatId === $targetChatId) {
+            $this->telegram->sendMessage($replyChatId, "❌ Manba va maqsad guruh bir xil bo'lishi mumkin emas.");
+            return ['status' => 'error', 'reason' => 'same_chat'];
+        }
+        if (!$this->auth->isAdmin($sourceChatId, $userId) || !$this->auth->isAdmin($targetChatId, $userId)) {
+            $this->telegram->sendMessage($replyChatId, "❌ Bu amal uchun IKKALA guruhning ham (manba va maqsad) administratori bo'lishingiz kerak.");
+            return ['status' => 'error', 'reason' => 'unauthorized'];
+        }
+
+        $applied = SettingsService::cloneInto($sourceChatId, $targetChatId);
+        $sourceTitle = $this->resolveGroupTitle($sourceChatId, '');
+        $targetTitle = $this->resolveGroupTitle($targetChatId, '');
+        $this->telegram->sendMessage($replyChatId,
+            "✅ Sozlamalar nusxalandi:\n"
+            . "Manba: {$sourceTitle} (<code>{$sourceChatId}</code>)\n"
+            . "Maqsad: {$targetTitle} (<code>{$targetChatId}</code>)\n\n"
+            . count($applied) . " ta sozlama qo'llandi.");
+        return ['status' => 'command_executed', 'cmd' => '/clonesettings', 'source_chat_id' => $sourceChatId, 'target_chat_id' => $targetChatId, 'applied' => $applied];
+    }
+
+    /**
+     * /broadcast matn — chaqiruvchi admin BOSHQARGAN barcha (faol) guruhlarga
+     * botning o'zi orqali bitta xabar yuborish (e'lon/ogohlantirish). Har bir
+     * guruh uchun alohida `App\Jobs\BroadcastMessageJob` navbatga qo'yiladi
+     * (bitta guruhga yetkazib bo'lmasa — masalan bot guruhdan chiqarilgan —
+     * qolganlariga ta'sir qilmaydi) va Telegram'ning umumiy bot tezlik
+     * chegarasidan (~30 xabar/soniya) saqlanish uchun har 20 ta guruhdan
+     * keyin +1 soniya kechikish qo'shiladi (2.0 Phase 4, 3-band).
+     */
+    private function handleBroadcastCommand(int $userId, string $text, int $replyChatId): array
+    {
+        $text = trim($text);
+        $groups = $this->adminGroupsOf($userId);
+
+        if ($groups === []) {
+            $this->telegram->sendMessage($replyChatId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+            return ['status' => 'error', 'reason' => 'no_groups'];
+        }
+
+        if ($text === '') {
+            $this->telegram->sendMessage($replyChatId,
+                "Foydalanish: <code>/broadcast xabar matni</code>\n\n"
+                . "Xabar siz boshqargan barcha (<b>" . count($groups) . "</b> ta) guruhga botning o'zi orqali yuboriladi.\n\n"
+                . "Guruhlaringiz:\n" . $this->managedGroupsHintText($groups));
+            return ['status' => 'error', 'reason' => 'empty_text'];
+        }
+
+        $escaped = htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+        $fullText = "📢 <b>Administrator xabari</b>\n\n{$escaped}";
+
+        $queued = 0;
+        foreach ($groups as $g) {
+            $targetChatId = (int)$g['chat_id'];
+            QueueService::push('App\Jobs\BroadcastMessageJob', [
+                'chat_id' => $targetChatId,
+                'text' => $fullText,
+                'admin_user_id' => $userId,
+            ], QueueService::PRIORITY_NORMAL, intdiv($queued, 20));
+            $queued++;
+        }
+
+        $this->telegram->sendMessage($replyChatId,
+            "✅ Xabaringiz <b>{$queued}</b> ta guruhga yuborish uchun navbatga qo'yildi.\n\n"
+            . "Yetkazilishi bir necha soniya ichida amalga oshadi (fon worker orqali). "
+            . "Agar botni chiqarib yuborgan yoki admin huquqini olib qo'ygan guruhlaringiz bo'lsa, ularga yetmaydi — boshqalariga ta'sir qilmaydi.");
+        return ['status' => 'command_executed', 'cmd' => '/broadcast', 'queued_groups' => $queued];
+    }
+
+    /**
+     * Telegram Stars pre_checkout_query'siga javob berish. Telegram bu so'rovni
+     * to'lov "Pay" tugmasi bosilgan zahoti yuboradi va 10 soniya ichida javob
+     * kutadi — shuning uchun bu yerda hech qanday og'ir/tarmoq amali BO'LMASLIGI
+     * kerak, faqat payload formatini tekshirish (2.0 Phase 3, 2-band).
+     */
+    private function handlePreCheckoutQuery(array $pcq): array
+    {
+        $id = (string)($pcq['id'] ?? '');
+        $payload = (string)($pcq['invoice_payload'] ?? '');
+
+        if (!preg_match('/^premium_v1:-?\d+:\d+$/', $payload)) {
+            $this->telegram->answerPreCheckoutQuery($id, false, "Noto'g'ri buyurtma. Iltimos, /premium buyrug'ini qayta yuboring.");
+            return ['status' => 'pre_checkout_rejected'];
+        }
+
+        $this->telegram->answerPreCheckoutQuery($id, true);
+        return ['status' => 'pre_checkout_accepted'];
+    }
+
+    /**
+     * Telegram Stars to'lovi muvaffaqiyatli yakunlangach (shaxsiy chatda oddiy
+     * message sifatida keladi, `successful_payment` maydoni bilan). Payloaddan
+     * maqsadli GURUH ID'sini ajratib oladi (invoys admin shaxsiy chatiga
+     * yuborilgan bo'lsa-da, premium GURUHga taalluqli — 2.0 Phase 3, 2-band).
+     */
+    private function handleSuccessfulPayment(array $payment, int $userId): array
+    {
+        $payload = (string)($payment['invoice_payload'] ?? '');
+        if (!preg_match('/^premium_v1:(-?\d+):(\d+)$/', $payload, $m)) {
+            Logger::error("Noma'lum formatdagi successful_payment payload", ['payload' => $payload], 'billing');
+            $this->telegram->sendMessage($userId, "❌ To'lov qabul qilindi, lekin buyurtma ma'lumotlarini aniqlab bo'lmadi. Iltimos, botga murojaat qiling.");
+            return ['status' => 'payment_payload_invalid'];
+        }
+
+        $chatId = (int)$m[1];
+        $days = (int)$m[2];
+        $chargeId = (string)($payment['telegram_payment_charge_id'] ?? '');
+        $starsAmount = (int)($payment['total_amount'] ?? 0);
+
+        $result = SubscriptionService::recordStarPayment($chatId, $userId, $chargeId, $starsAmount, $days, $payload);
+
+        if (!$result['recorded']) {
+            $this->telegram->sendMessage($userId,
+                "ℹ️ Bu to'lov allaqachon qayta ishlangan. Joriy premium muddati: <code>{$result['premium_expires_at']}</code>");
+            return ['status' => 'payment_already_recorded', 'chat_id' => $chatId];
+        }
+
+        $groupLabel = $this->resolveGroupTitle($chatId, '');
+        $this->telegram->sendMessage($userId,
+            "✅ Rahmat! To'lov qabul qilindi.\n\n"
+            . "Guruh: {$groupLabel}\n"
+            . "Premium muddati: <code>{$result['premium_expires_at']}</code> (UTC) gacha uzaytirildi.\n\n"
+            . "Endi bu guruhda AI tekshiruvlar kunlik chegarasiz ishlaydi.");
+        return ['status' => 'payment_recorded', 'chat_id' => $chatId, 'premium_expires_at' => $result['premium_expires_at']];
+    }
+
+    /**
+     * /premium buyrug'i — guruhning joriy tarif holatini (bepul/premium)
+     * ko'rsatadi va sotib olish/uzaytirish tugmasini yuboradi
+     * (2.0 Phase 3, 2-band — monetizatsiya).
+     */
+    private function handlePremiumStatusCommand(int $chatId, int $replyChatId): array
+    {
+        $plan = SubscriptionService::getPlan($chatId);
+        $stars = Config::getInt('PREMIUM_STARS_PRICE', 200);
+        $days = Config::getInt('PREMIUM_DURATION_DAYS', 30);
+        $buttons = ['inline_keyboard' => [[
+            ['text' => "⭐ Premium sotib olish ({$stars} Stars / {$days} kun)", 'callback_data' => "buy_premium:{$chatId}"],
+        ]]];
+
+        if ($plan['is_premium']) {
+            $this->telegram->sendMessage($replyChatId,
+                "⭐ Bu guruh hozir <b>Premium</b> tarifda.\n\n"
+                . "Muddati: <code>{$plan['premium_expires_at']}</code> (UTC) gacha.\n"
+                . "AI tekshiruvlar kunlik chegarasiz.\n\n"
+                . "Muddatni uzaytirmoqchi bo'lsangiz, quyidagi tugmadan foydalaning — qolgan kunlar yo'qolmaydi.",
+                ['reply_markup' => $buttons]);
+            return ['status' => 'premium_status_shown', 'plan' => 'premium'];
+        }
+
+        $used = SubscriptionService::dailyAiRequestCount($chatId);
+        $limit = Config::getInt('FREE_TIER_DAILY_AI_REQUESTS', 150);
+        $limitText = $limit > 0 ? "{$used}/{$limit}" : "{$used} (chegarasiz)";
+        $this->telegram->sendMessage($replyChatId,
+            "🆓 Bu guruh hozir <b>Bepul</b> tarifda.\n\n"
+            . "Bugungi AI so'rovlar: <code>{$limitText}</code>\n\n"
+            . "Premium olsangiz — AI tekshiruvlar (matn/rasm/video/ovoz) kunlik chegarasiz bo'ladi. "
+            . "Mahalliy qoidalar (so'z bloklash, havola filtri) chegaradan qat'i nazar doim ishlaydi.",
+            ['reply_markup' => $buttons]);
+        return ['status' => 'premium_status_shown', 'plan' => 'free'];
+    }
+
+    /**
+     * "⭐ Premium sotib olish" tugmasi bosilganda Telegram Stars invoysini
+     * yuboradi. Faqat shu guruh admini bosishi mumkin (chaqiruvchi
+     * handleCallbackQuery'da allaqachon admin ekanligi tekshirilgan).
+     */
+    private function handleBuyPremiumCallback(int $chatId, int $userId, string $cbId): array
+    {
+        $stars = Config::getInt('PREMIUM_STARS_PRICE', 200);
+        $days = Config::getInt('PREMIUM_DURATION_DAYS', 30);
+        $payload = "premium_v1:{$chatId}:{$days}";
+
+        $this->telegram->answerCallbackQuery($cbId);
+        $this->telegram->sendInvoice(
+            $userId,
+            "Block-BOT Premium — {$days} kun",
+            "Ushbu guruh uchun {$days} kunlik Premium obuna: AI tekshiruvlar (matn/rasm/video/ovoz) kunlik chegarasiz.",
+            $payload,
+            $stars,
+            "Premium obuna ({$days} kun)"
+        );
+        return ['status' => 'invoice_sent', 'chat_id' => $chatId, 'stars' => $stars, 'days' => $days];
+    }
+
+    /**
      * Shaxsiy chatda /blockword, /allowword, /unblockword, /wordlist buyruqlari uchun
      * qaysi guruhga tegishli ekanini aniqlaydi. Admin faqat bitta guruhni boshqarsa —
      * avtomatik shu guruh tanlanadi; bir nechta bo'lsa, buyruq guruh ID bilan
@@ -454,7 +1011,7 @@ class UpdateRouter
         $adminUserId = (int)($message['from']['id'] ?? 0);
 
         if ($targetUserId <= 0) {
-            $this->telegram->sendMessage($chatId, "Foydalanuvchini ko'rsatish uchun uning xabariga reply qiling yoki ID raqamini kiriting.");
+            $this->telegram->sendMessage($chatId, "Foydalanuvchini ko'rsatish uchun uning xabariga reply qiling yoki ID raqamini kiriting.", $this->threadExtra($message));
             return ['status' => 'error', 'reason' => 'target_user_not_found'];
         }
 
@@ -507,6 +1064,35 @@ class UpdateRouter
         return ['status' => 'command_executed', 'cmd' => $cmd];
     }
 
+    /**
+     * /addmod, /removemod — botning ichki, cheklangan huquqli "moderator" rolini
+     * (faqat /warn, /mute, /unmute, /warnings buyruqlariga ruxsat beradi) xabarga
+     * reply qilib belgilash/bekor qilish. Faqat to'liq adminlar chaqira oladi
+     * (handleCommand() darajasida allaqachon tekshirilgan).
+     */
+    private function handleModeratorRoleCommand(string $cmd, array $message, array $parts, int $chatId): array
+    {
+        $targetUserId = $this->resolveTargetUserId($message, $parts);
+        if ($targetUserId <= 0) {
+            $this->telegram->sendMessage($chatId, "Foydalanuvchini ko'rsatish uchun uning xabariga reply qiling yoki ID raqamini kiriting.", $this->threadExtra($message));
+            return ['status' => 'error', 'reason' => 'target_user_not_found'];
+        }
+
+        if ($this->auth->isAdmin($chatId, $targetUserId)) {
+            $this->telegram->sendMessage($chatId, "ℹ️ Bu foydalanuvchi allaqachon guruh administratori — alohida moderator huquqi shart emas.", $this->threadExtra($message));
+            return ['status' => 'already_admin', 'cmd' => $cmd, 'target_user_id' => $targetUserId];
+        }
+
+        $makeModerator = $cmd === '/addmod';
+        AdminAuthorizationService::setModeratorRole($chatId, $targetUserId, $makeModerator);
+
+        $this->telegram->sendMessage($chatId, $makeModerator
+            ? "✅ <a href=\"tg://user?id={$targetUserId}\">Foydalanuvchi</a> endi moderator: /warn, /mute, /unmute, /warnings buyruqlaridan foydalana oladi (boshqa admin buyruqlari va /settings unga yopiq)."
+            : "✅ <a href=\"tg://user?id={$targetUserId}\">Foydalanuvchi</a>ning moderator huquqi bekor qilindi.", $this->threadExtra($message));
+
+        return ['status' => 'command_executed', 'cmd' => $cmd, 'target_user_id' => $targetUserId, 'is_moderator' => $makeModerator];
+    }
+
     private function handleCallbackQuery(array $cb): array
     {
         $cbId = (string)($cb['id'] ?? '');
@@ -532,6 +1118,10 @@ class UpdateRouter
 
         if (in_array($action, ['appeal_accept', 'appeal_reject'], true)) {
             return $this->reviewAppeal((int)($parts[1] ?? 0), $userId, $action === 'appeal_accept', $cbId);
+        }
+
+        if ($action === 'captcha_verify') {
+            return $this->handleCaptchaVerify((int)($parts[1] ?? 0), (int)($parts[2] ?? 0), $userId, $cbId);
         }
 
         // Audit / a'zolar sweep topilmalarini tasdiqli tozalash (parts[1] = session_id).
@@ -630,6 +1220,12 @@ class UpdateRouter
             $messageChatId = (int)($cb['message']['chat']['id'] ?? $chatId);
             $this->sendSettingsMenu($chatId, $cb['message']['message_id'] ?? null, $messageChatId);
             return ['status' => 'settings_opened'];
+        }
+
+        // Telegram Stars orqali premium sotib olish (2.0 Phase 3, 2-band).
+        // $chatId ustidagi admin tekshiruvi yuqorida (satr ~772) allaqachon o'tildi.
+        if ($action === 'buy_premium') {
+            return $this->handleBuyPremiumCallback($chatId, $userId, $cbId);
         }
 
         $this->telegram->answerCallbackQuery($cbId, "Qabul qilindi");
@@ -862,6 +1458,47 @@ class UpdateRouter
         return ['status' => $newStatus, 'appeal_id' => $appealId];
     }
 
+    /**
+     * "✅ Men botman emas" tugmasi bosilganda chaqiriladi. Faqat tugmada
+     * ko'rsatilgan (yangi qo'shilgan) foydalanuvchining o'zi bosishi mumkin.
+     */
+    private function handleCaptchaVerify(int $chatId, int $targetUserId, int $clickerId, string $cbId): array
+    {
+        $lang = Translator::normalizeLang(SettingsService::get($chatId)['language'] ?? null);
+
+        if ($chatId === 0 || $targetUserId === 0) {
+            $this->telegram->answerCallbackQuery($cbId, Translator::get('captcha.invalid_request', $lang), true);
+            return ['status' => 'not_found'];
+        }
+        if ($clickerId !== $targetUserId) {
+            $this->telegram->answerCallbackQuery($cbId, Translator::get('captcha.not_your_button', $lang), true);
+            return ['status' => 'unauthorized'];
+        }
+
+        $result = CaptchaGuard::verify($chatId, $targetUserId);
+        if ($result === null) {
+            $this->telegram->answerCallbackQuery($cbId, Translator::get('captcha.expired', $lang), true);
+            return ['status' => 'captcha_not_pending'];
+        }
+
+        $this->telegram->unmuteUser($chatId, $targetUserId);
+        $this->telegram->answerCallbackQuery($cbId, Translator::get('captcha.verified_toast', $lang));
+
+        $messageId = (int)$result['message_id'];
+        if ($messageId > 0) {
+            $userLink = "<a href=\"tg://user?id={$targetUserId}\">" . Translator::get('common.user', $lang) . "</a>";
+            $this->telegram->request('editMessageText', [
+                'chat_id' => $chatId,
+                'message_id' => $messageId,
+                'text' => Translator::get('captcha.verified_message', $lang, ['user_link' => $userLink]),
+                'parse_mode' => 'HTML',
+                'reply_markup' => ['inline_keyboard' => []],
+            ]);
+        }
+
+        return ['status' => 'captcha_verified'];
+    }
+
     private function handlePrivateAdminAction(string $action, int $chatId, int $adminId, int $targetChatId): array
     {
         if ($chatId === 0 || !$this->auth->isAdmin($chatId, $adminId)) {
@@ -1074,6 +1711,12 @@ class UpdateRouter
                     ['text' => ($s['link_filter'] ? '✅' : '❌') . " Havola (link) filtri", 'callback_data' => "set_link_filter:{$chatId}"],
                 ],
                 [
+                    ['text' => (($s['flood_enabled'] ?? 1) ? '✅' : '❌') . " Anti-flood (" . (int)($s['flood_max_messages'] ?? 6) . "/" . (int)($s['flood_window_sec'] ?? 10) . "s)", 'callback_data' => "set_flood_enabled:{$chatId}"],
+                ],
+                [
+                    ['text' => (($s['captcha_enabled'] ?? 0) ? '✅' : '❌') . " Yangi a'zo CAPTCHA (" . (int)($s['captcha_timeout_sec'] ?? 60) . "s)", 'callback_data' => "set_captcha_enabled:{$chatId}"],
+                ],
+                [
                     ['text' => (($s['ai_mode'] ?? '') === 'comprehensive' ? '🧠' : '⚡') . " AI: " . ($s['ai_mode'] ?? 'comprehensive'), 'callback_data' => "set_ai_mode:{$chatId}"],
                 ],
                 [
@@ -1114,6 +1757,33 @@ class UpdateRouter
     /**
      * Shaxsiy chatdagi bosh menyu (inline tugmalar).
      */
+    /**
+     * Mini App (Web Dashboard) manzili — 2.0 Phase 3, 3-band. Ixtiyoriy
+     * `MINIAPP_URL` bilan aniq belgilanadi; bo'lmasa `TELEGRAM_WEBHOOK_URL`ning
+     * domenidan avtomatik hosil qilinadi (`/miniapp/` yo'li, xuddi shu domenda
+     * `public/miniapp/index.html` joylashgani uchun). Telegram `web_app`
+     * tugmasi FAQAT https:// manzilni qabul qiladi — mos kelmasa (yoki hech
+     * narsa sozlanmagan bo'lsa) tugma butunlay ko'rsatilmaydi.
+     */
+    private function miniAppUrl(): ?string
+    {
+        $explicit = trim((string)Config::get('MINIAPP_URL', ''));
+        $url = $explicit;
+        if ($url === '') {
+            $webhookUrl = trim((string)Config::get('TELEGRAM_WEBHOOK_URL', ''));
+            if ($webhookUrl === '') {
+                return null;
+            }
+            $parts = parse_url($webhookUrl);
+            if (!isset($parts['scheme'], $parts['host'])) {
+                return null;
+            }
+            $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+            $url = "{$parts['scheme']}://{$parts['host']}{$port}/miniapp/";
+        }
+        return str_starts_with($url, 'https://') ? $url : null;
+    }
+
     private function sendMainMenu(int $userId, ?int $editMessageId = null): array
     {
         $botUser = ltrim((string)Config::get('TELEGRAM_BOT_USERNAME', ''), '@');
@@ -1128,6 +1798,10 @@ class UpdateRouter
                 ['text' => '❓ Yordam', 'callback_data' => 'pm_help'],
             ],
         ];
+        $miniAppUrl = $this->miniAppUrl();
+        if ($miniAppUrl !== null) {
+            $rows[] = [['text' => '📊 Dashboard', 'web_app' => ['url' => $miniAppUrl]]];
+        }
         if ($botUser !== '') {
             $rows[] = [['text' => '➕ Meni guruhga qo\'shish', 'url' => "https://t.me/{$botUser}?startgroup=true"]];
         }
@@ -1152,7 +1826,12 @@ class UpdateRouter
             . "Botni keraksiz xabar bilan to'ldirmaslik uchun guruhda FAQAT xabarga \"reply\" "
             . "qilib beriladigan to'g'ridan-to'g'ri moderatsiya buyruqlari ishlaydi:\n"
             . "/warn /mute [soat] /ban — xabarga reply qilib jazo berish\n"
-            . "/unmute /unban /resetwarns /warnings — cheklovni yechish/ko'rish\n\n"
+            . "/unmute /unban /resetwarns /warnings — cheklovni yechish/ko'rish\n"
+            . "/addmod /removemod — xabarga reply qilib botning ichki \"moderator\" rolini "
+            . "berish/bekor qilish (faqat to'liq adminlar chaqira oladi)\n\n"
+            . "<b>Botning ichki \"moderator\" roli (/addmod bilan berilgan a'zolar):</b>\n"
+            . "Faqat /warn, /mute, /unmute, /warnings buyruqlaridan foydalana oladi — /ban, "
+            . "/unban, /resetwarns, /settings va boshqa admin buyruqlari ularga yopiq.\n\n"
             . "<b>Shaxsiy chatда (barcha boshqa buyruqlar shu yerda):</b>\n"
             . "/menu — bosh menyu\n"
             . "/mygroups — guruhlaringiz ro'yxati va sozlamalari\n"
@@ -1165,6 +1844,14 @@ class UpdateRouter
             . "/audit_status /audit_pause /audit_resume /audit_cancel /audit_report — audit boshqaruvi\n"
             . "/blockword, /allowword, /unblockword guruh_id so'z — jargon/lahjadagi maxsus so'zlarni boshqarish\n"
             . "/wordlist [guruh_id] — maxsus so'z qoidalari ro'yxati\n"
+            . "/modlist [guruh_id] — botning ichki moderatorlari ro'yxati\n"
+            . "/til [guruh_id] [uz|ru|en] — guruh a'zolariga ko'rinadigan xabarlar "
+            . "(CAPTCHA, ogohlantirish/mute/ban) tilini ko'rish/o'zgartirish\n"
+            . "/exportsettings [guruh_id] — guruh sozlamalarini JSON ko'rinishida olish\n"
+            . "/importsettings guruh_id {JSON} — eksport qilingan JSON'ni guruhga qo'llash\n"
+            . "/clonesettings manba_id maqsad_id — bir guruh sozlamalarini boshqasiga to'g'ridan-to'g'ri nusxalash "
+            . "(ikkalasining ham admini bo'lishingiz shart)\n"
+            . "/broadcast matn — boshqargan barcha guruhlaringizga botning o'zi orqali bitta e'lon/ogohlantirish yuborish\n"
             . "<i>(Bir nechta guruhni boshqarsangiz, guruh ID'ni buyruqdan oldin ko'rsating — /mygroups orqali ko'rish mumkin)</i>\n"
             . "/appeal ID — cheklovga shikoyat\n\n"
             . "<b>Eski xabarlar auditi qanday ishlaydi?</b>\n"
@@ -1258,22 +1945,9 @@ class UpdateRouter
      */
     private function adminGroupsOf(int $userId): array
     {
-        $pdo = Database::getConnection();
-        if ($this->auth->isSystemAdmin($userId)) {
-            $stmt = $pdo->prepare("SELECT chat_id, title FROM `groups` WHERE is_active = 1 ORDER BY updated_at DESC");
-            $stmt->execute();
-        } else {
-            $stmt = $pdo->prepare("
-                SELECT c.chat_id, g.title
-                FROM chat_members c
-                LEFT JOIN `groups` g ON g.chat_id = c.chat_id
-                WHERE c.user_id = :uid AND c.role IN ('creator', 'administrator')
-                  AND (g.is_active = 1 OR g.is_active IS NULL)
-                ORDER BY g.updated_at DESC
-            ");
-            $stmt->execute(['uid' => $userId]);
-        }
-        return $stmt->fetchAll() ?: [];
+        // Yagona manba: App\Policy\AdminAuthorizationService::adminGroupsOfUser()
+        // (Mini App REST API ham xuddi shu metoddan foydalanadi — 2.0 Phase 3, 3-band).
+        return AdminAuthorizationService::adminGroupsOfUser($userId);
     }
 
     private function handlePrivateChat(array $message): array
@@ -1281,6 +1955,11 @@ class UpdateRouter
         $from = $message['from'] ?? [];
         $userId = (int)($from['id'] ?? 0);
         $text = trim((string)($message['text'] ?? ''));
+
+        // Telegram Stars to'lovi muvaffaqiyatli yakunlandi (2.0 Phase 3, 2-band).
+        if (!empty($message['successful_payment'])) {
+            return $this->handleSuccessfulPayment($message['successful_payment'], $userId);
+        }
 
         if (!empty($message['document'])) {
             $upload = $this->handlePrivateAuditUpload($message, $userId);
@@ -1359,6 +2038,143 @@ class UpdateRouter
             }
 
             return $this->handleWordListCommand($resolved['chat_id'], $userId);
+        }
+
+        // /modlist — guruhning botga tayinlangan moderatorlari ro'yxatini shaxsiy chatda ko'rsatish.
+        if (preg_match('/^\/modlist(?:@\w+)?(?:\s+(.*))?$/i', $text, $match)) {
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[1] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/modlist -100...</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            return $this->handleModListCommand($resolved['chat_id'], $userId);
+        }
+
+        // /til — guruh a'zolariga ko'rinadigan xabarlar (CAPTCHA, ogohlantirish/mute/ban)
+        // qaysi tilda yuborilishini tanlash/ko'rish (2.0 Phase 3, 1-band — i18n).
+        if (preg_match('/^\/til(?:@\w+)?(?:\s+(.*))?$/i', $text, $match)) {
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[1] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/til -100... uz|ru|en</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            return $this->handleLanguageCommand($resolved['chat_id'], $resolved['rest'], $userId);
+        }
+
+        // /premium — guruhning tarif holatini (bepul/premium) ko'rsatish va Telegram
+        // Stars orqali sotib olish tugmasini yuborish (2.0 Phase 3, 2-band — monetizatsiya).
+        if (preg_match('/^\/premium(?:@\w+)?(?:\s+(.*))?$/i', $text, $match)) {
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[1] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/premium -100...</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            return $this->handlePremiumStatusCommand($resolved['chat_id'], $userId);
+        }
+
+        // /exportsettings — guruhning joriy sozlamalarini JSON ko'rinishida ko'rsatish
+        // (2.0 Phase 4, 2-band — sozlamalarni klonlash/eksport-import).
+        if (preg_match('/^\/exportsettings(?:@\w+)?(?:\s+(.*))?$/i', $text, $match)) {
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[1] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/exportsettings -100...</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            return $this->handleExportSettingsCommand($resolved['chat_id'], $userId);
+        }
+
+        // /importsettings guruh_id {...JSON...} — /exportsettings'dan olingan (yoki
+        // qo'lda tuzilgan) JSON'ni guruhga qo'llash (2.0 Phase 4, 2-band).
+        if (preg_match('/^\/importsettings(?:@\w+)?(?:\s+([\s\S]*))?$/i', $text, $match)) {
+            $resolved = $this->resolvePrivateManagedChat($userId, trim((string)($match[1] ?? '')));
+
+            if ($resolved['error'] === 'no_groups') {
+                $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi. Botni guruhingizga admin qilib qo'shing.");
+                return ['status' => 'managed_group_not_found'];
+            }
+            if ($resolved['error'] === 'unauthorized') {
+                $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
+                return ['status' => 'unauthorized'];
+            }
+            if ($resolved['error'] === 'ambiguous' || $resolved['rest'] === '') {
+                $this->telegram->sendMessage($userId,
+                    "Siz bir nechta guruhni boshqarasiz (yoki JSON ko'rsatilmadi). Foydalanish:\n"
+                    . "<code>/importsettings -100... {...JSON...}</code>\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                return ['status' => 'private_group_selection_required'];
+            }
+
+            return $this->handleImportSettingsCommand($resolved['chat_id'], $resolved['rest'], $userId);
+        }
+
+        // /clonesettings manba_guruh_id maqsad_guruh_id — bitta guruh sozlamalarini
+        // to'g'ridan-to'g'ri (JSON'siz) boshqa guruhga nusxalash. Ikkala ID ham
+        // aniq ko'rsatilishi SHART (2.0 Phase 4, 2-band).
+        if (preg_match('/^\/clonesettings(?:@\w+)?(?:\s+(.*))?$/is', $text, $match)) {
+            $arg = trim((string)($match[1] ?? ''));
+            if (!preg_match('/^(-?\d{6,})\s+(-?\d{6,})$/', $arg, $ids)) {
+                $groups = $this->adminGroupsOf($userId);
+                $this->telegram->sendMessage($userId,
+                    "Foydalanish: <code>/clonesettings manba_guruh_id maqsad_guruh_id</code>\n\n"
+                    . "Ikkalasining ham administratori bo'lishingiz shart.\n\n"
+                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($groups));
+                return ['status' => 'error', 'reason' => 'invalid_arguments'];
+            }
+            return $this->handleCloneSettingsCommand($userId, (int)$ids[1], (int)$ids[2], $userId);
+        }
+
+        // /broadcast matn — admin boshqargan barcha guruhlarga botning o'zi orqali
+        // bitta xabar (e'lon/ogohlantirish) yuborish (2.0 Phase 4, 3-band).
+        if (preg_match('/^\/broadcast(?:@\w+)?(?:\s+([\s\S]*))?$/i', $text, $match)) {
+            return $this->handleBroadcastCommand($userId, trim((string)($match[1] ?? '')), $userId);
         }
 
         // Agar /start settings_-100... deb kelgan bo'lsa:

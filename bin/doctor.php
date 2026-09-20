@@ -306,10 +306,10 @@ if ($info['ok'] ?? false) {
     } else {
         line("  • So'nggi xato         : yo'q ✅");
     }
-    $need = ['message', 'edited_message', 'callback_query', 'my_chat_member', 'chat_member'];
+    $need = ['message', 'edited_message', 'callback_query', 'my_chat_member', 'chat_member', 'pre_checkout_query'];
     $missUpd = array_diff($need, (array)($r['allowed_updates'] ?? []));
     if ($missUpd !== []) {
-        $warnings[] = "Webhook allowed_updates da yetishmaydi: " . implode(', ', $missUpd) . " (chat_member bo'lmasa yangi a'zo skani ishlamaydi).";
+        $warnings[] = "Webhook allowed_updates da yetishmaydi: " . implode(', ', $missUpd) . " (chat_member bo'lmasa yangi a'zo skani ishlamaydi, pre_checkout_query bo'lmasa Telegram Stars to'lovlari ishlamaydi).";
     }
     if ($registered === '') {
         $problems[] = "Webhook umuman o'rnatilmagan.";
@@ -457,7 +457,7 @@ line();
 if ($setWebhook) {
     if ($meOk && str_starts_with($webhookUrl, 'https://') && strlen($webhookSec) >= 32) {
         line("[10] --set-webhook: webhook o'rnatilmoqda → {$webhookUrl}");
-        $set = $telegram->setWebhook($webhookUrl, $webhookSec, ['message', 'edited_message', 'callback_query', 'my_chat_member', 'chat_member']);
+        $set = $telegram->setWebhook($webhookUrl, $webhookSec, ['message', 'edited_message', 'callback_query', 'my_chat_member', 'chat_member', 'pre_checkout_query']);
         line("  • webhook: " . (($set['ok'] ?? false) ? "✅ o'rnatildi" : "❌ " . ($set['description'] ?? 'xato')));
         $c1 = $telegram->setMyCommands([
             ['command' => 'menu', 'description' => 'Bosh menyu'],

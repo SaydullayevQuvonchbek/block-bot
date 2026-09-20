@@ -68,7 +68,7 @@ switch ($action) {
             exit(1);
         }
 
-        $allowedUpdates = ['message', 'edited_message', 'callback_query', 'chat_member', 'my_chat_member'];
+        $allowedUpdates = ['message', 'edited_message', 'callback_query', 'chat_member', 'my_chat_member', 'pre_checkout_query'];
         echo "Webhook o'rnatilmoqda: {$url} ...\n";
         $res = $telegram->setWebhook($url, $secret, $allowedUpdates);
 

@@ -6,6 +6,7 @@ namespace App\AI;
 
 use App\Core\Config;
 use App\Core\Logger;
+use App\Policy\SubscriptionService;
 use RuntimeException;
 use Throwable;
 
@@ -160,11 +161,47 @@ class OpenRouterClient
     }
 
     /**
+     * Ovozli/audio xabarlarni moderatsiya qilish. OpenRouter'ning standart chat-completions
+     * API'si Telegram ovozli xabarlarining OGG/Opus formatini rasman qo'llab-quvvatlamaydi
+     * (odatda faqat wav/mp3), shu sababli bu yerda xavfsiz "unscannable" natija qaytariladi —
+     * xabar bloklanmaydi, lekin adminга tekshirib bo'lmagani haqida signal beriladi.
+     * GeminiClient bu metodni Google Gemini'ning native audio inline_data qo'llab-quvvatlashi
+     * bilan qayta yozadi (haqiqiy tahlil faqat o'sha provayderda amalga oshadi).
+     */
+    public function moderateAudio(string $audioPath, string $caption = '', string $itemId = 'item_1', ?int $chatId = null, ?string $customModel = null): array
+    {
+        return [
+            'item_id' => $itemId,
+            'status' => 'unscannable',
+            'category' => 'audio_unsupported_provider',
+            'reason' => "Joriy AI provayder (" . $this->providerName() . ") ovozli xabarlarni to'g'ridan-to'g'ri tahlil qila olmaydi",
+            'evidence' => '',
+            'model' => 'none',
+            'cost_usd' => 0.0,
+        ];
+    }
+
+    /**
      * Fallback va budjet nazorati bilan so'rov yuborish
      */
     private function callWithFallback(array $messages, string $preferredModel, string $type, string $itemId, ?int $chatId): array
     {
         $estimatedCost = $type === 'vision' ? 0.002 : 0.0005;
+
+        // 0. Bepul tarif kunlik AI so'rov chegarasi (2.0 Phase 3, 2-band — monetizatsiya).
+        // Premium guruhlar uchun har doim o'tadi. Global $ budjet tekshiruvidan (pastda)
+        // ATAYLAB ALOHIDA — bu GURUH darajasidagi (per-chat) chegara.
+        if ($chatId !== null && !SubscriptionService::canUseAi($chatId)) {
+            return [
+                'item_id' => $itemId,
+                'status' => 'review',
+                'category' => 'free_tier_limit_reached',
+                'reason' => "Bepul tarifning kunlik AI so'rov chegarasiga yetdi",
+                'evidence' => '',
+                'model' => 'none',
+                'cost_usd' => 0.0,
+            ];
+        }
 
         // 1. Budjet tekshiruvi va atomik rezervatsiya
         $reservationKey = UsageBudgetService::reserveBudget($estimatedCost);
@@ -352,7 +389,7 @@ class OpenRouterClient
     {
         return <<<PROMPT
 Sen professional Telegram moderatsiya tahlilchisisan.
-Vazifang: berilgan matn yoki rasmni guruh qoidalariga muvofiq tekshirish va QAT'IY ravishda faqat JSON formatida javob qaytarish.
+Vazifang: berilgan matn, rasm yoki ovozli xabarni (audio) guruh qoidalariga muvofiq tekshirish va QAT'IY ravishda faqat JSON formatida javob qaytarish. Ovozli xabar berilsa — undagi nutqni transkripsiya qilgandek tahlil qil va xuddi shu qoidalarni qo'lla.
 
 Qoidalar:
 1. Pornografiya, behayo/ochiq jinsiy rasmlar, intim xizmatlar reklamasi va fohishabozlik takliflari - UNSAFE (category: "pornography").

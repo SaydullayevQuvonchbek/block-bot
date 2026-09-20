@@ -6,6 +6,7 @@ require_once dirname(__DIR__) . '/vendor/autoload.php';
 
 use App\Core\Config;
 use App\Core\Database;
+use App\Core\HealthCheck;
 use App\Core\Logger;
 use App\Core\QueueService;
 
@@ -14,6 +15,10 @@ Config::load();
 echo "=========================================================\n";
 echo "🛡 Block-BOT: Doimiy Navbat Xizmatchisi (VPS Worker Daemon)\n";
 echo "=========================================================\n";
+// Gorizontal-scaling: bir nechta worker parallel ishlaganda, har biri o'zining WORKER_ID
+// muhit o'zgaruvchisi bilan ishga tushiriladi (README_VPS.md "Gorizontal scaling"
+// bo'limiga qarang) — shu orqali har biri alohida health-check "jonlik" fayliga yozadi.
+echo "Worker ID: " . HealthCheck::workerId() . "\n";
 echo "Worker ishga tushdi. To'xtatish uchun Ctrl+C bosing.\n\n";
 
 $shouldRun = true;
@@ -36,6 +41,10 @@ while ($shouldRun) {
     if (function_exists('pcntl_signal_dispatch')) {
         pcntl_signal_dispatch();
     }
+
+    // Salomatlik tekshiruvi (bin/healthcheck.php, public/healthz.php) shu belgi orqali
+    // workerning "jonligini" biladi — har tsiklda (band yoki bo'sh, farqi yo'q) yangilanadi.
+    HealthCheck::writeHeartbeat();
 
     try {
         $job = QueueService::reserve('default');

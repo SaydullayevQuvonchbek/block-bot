@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>Block-BOT Dashboard</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #1c1c1e);
+    --hint: var(--tg-theme-hint-color, #8e8e93);
+    --link: var(--tg-theme-link-color, #2481cc);
+    --button: var(--tg-theme-button-color, #2481cc);
+    --button-text: var(--tg-theme-button-text-color, #ffffff);
+    --secondary-bg: var(--tg-theme-secondary-bg-color, #f2f2f7);
+    --card-bg: var(--tg-theme-section-bg-color, #ffffff);
+    --danger: #e53935;
+    --success: #2e7d32;
+    --warn: #ef6c00;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px 12px 32px;
+    background: var(--secondary-bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 15px;
+  }
+  h1 { font-size: 18px; margin: 4px 0 12px; }
+  h2 { font-size: 15px; margin: 0 0 8px; color: var(--hint); font-weight: 600; text-transform: uppercase; letter-spacing: .02em; }
+  .card {
+    background: var(--card-bg); border-radius: 14px; padding: 14px;
+    margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,.05);
+  }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid rgba(120,120,128,.15); }
+  .row:last-child { border-bottom: none; }
+  .row .label { color: var(--hint); font-size: 13px; }
+  .row .value { font-weight: 600; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.free { background: rgba(142,142,147,.15); color: var(--hint); }
+  .badge.premium { background: rgba(46,125,50,.15); color: var(--success); }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; padding-bottom: 2px; }
+  .tab {
+    flex: 0 0 auto; padding: 8px 14px; border-radius: 10px; background: var(--card-bg);
+    color: var(--hint); font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+  }
+  .tab.active { background: var(--button); color: var(--button-text); }
+  .btn {
+    display: inline-block; padding: 9px 14px; border-radius: 10px; border: none;
+    background: var(--button); color: var(--button-text); font-size: 14px; font-weight: 600;
+    cursor: pointer; text-align: center;
+  }
+  .btn.secondary { background: rgba(120,120,128,.15); color: var(--text); }
+  .btn.danger { background: var(--danger); color: #fff; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .toggle-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid rgba(120,120,128,.15); }
+  .toggle-row:last-child { border-bottom: none; }
+  .toggle-row .desc { font-size: 12px; color: var(--hint); margin-top: 2px; }
+  .switch { position: relative; width: 46px; height: 26px; flex: 0 0 auto; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: rgba(120,120,128,.3); border-radius: 999px; cursor: pointer; transition: .15s; }
+  .slider::before { content: ""; position: absolute; width: 22px; height: 22px; left: 2px; top: 2px; background: #fff; border-radius: 50%; transition: .15s; }
+  input:checked + .slider { background: var(--success); }
+  input:checked + .slider::before { transform: translateX(20px); }
+  .group-item {
+    padding: 12px; border-radius: 12px; background: var(--card-bg); margin-bottom: 8px;
+    cursor: pointer; display: flex; justify-content: space-between; align-items: center;
+  }
+  .group-item:active { opacity: .7; }
+  .empty { text-align: center; color: var(--hint); padding: 32px 12px; font-size: 14px; }
+  .error-box { background: rgba(229,57,53,.1); color: var(--danger); border-radius: 10px; padding: 12px; margin-bottom: 12px; font-size: 13px; }
+  .spinner { text-align: center; padding: 40px 0; color: var(--hint); }
+  .list-item { padding: 10px 0; border-bottom: 1px solid rgba(120,120,128,.15); }
+  .list-item:last-child { border-bottom: none; }
+  .list-item .who { font-weight: 600; font-size: 14px; }
+  .list-item .meta { font-size: 12px; color: var(--hint); margin: 2px 0 6px; }
+  select, input[type=number] {
+    background: var(--secondary-bg); color: var(--text); border: none; border-radius: 8px;
+    padding: 6px 10px; font-size: 14px;
+  }
+</style>
+</head>
+<body>
+<div id="app"><div class="spinner">Yuklanmoqda…</div></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  if (tg) { tg.ready(); tg.expand(); }
+
+  var initData = tg ? tg.initData : '';
+  var state = { groups: [], chatId: null, tab: 'overview', overview: null, settings: null, warnings: null, appeals: null };
+  var app = document.getElementById('app');
+
+  function api(action, opts) {
+    opts = opts || {};
+    var qs = 'action=' + encodeURIComponent(action);
+    if (opts.query) {
+      for (var k in opts.query) { qs += '&' + encodeURIComponent(k) + '=' + encodeURIComponent(opts.query[k]); }
+    }
+    var fetchOpts = {
+      method: opts.body ? 'POST' : 'GET',
+      headers: { 'X-Telegram-Init-Data': initData },
+    };
+    if (opts.body) {
+      fetchOpts.headers['Content-Type'] = 'application/json';
+      fetchOpts.body = JSON.stringify(opts.body);
+    }
+    return fetch('../api.php?' + qs, fetchOpts).then(function (res) {
+      return res.json().then(function (json) {
+        if (!json.ok) { throw new Error(json.message || json.error || 'Xatolik'); }
+        return json;
+      });
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function render(html) { app.innerHTML = html; }
+
+  function renderError(message) {
+    render('<div class="error-box">⚠️ ' + escapeHtml(message) + '</div><div class="btn-row"><button class="btn secondary" onclick="location.reload()">Qayta urinish</button></div>');
+  }
+
+  // ---- Guruh tanlash ekrani ----
+
+  function loadGroups() {
+    render('<div class="spinner">Guruhlar yuklanmoqda…</div>');
+    api('me').then(function (res) {
+      state.groups = res.groups || [];
+      if (state.groups.length === 0) {
+        render('<div class="empty">Siz boshqaradigan faol guruh topilmadi.<br>Botni guruhingizga admin qilib qo\'shing.</div>');
+        return;
+      }
+      if (state.groups.length === 1) {
+        selectGroup(state.groups[0].chat_id);
+        return;
+      }
+      renderGroupPicker();
+    }).catch(function (e) { renderError(e.message); });
+  }
+
+  function renderGroupPicker() {
+    var html = '<h1>📋 Guruhingizni tanlang</h1>';
+    state.groups.forEach(function (g) {
+      html += '<div class="group-item" data-cid="' + g.chat_id + '"><span>' + escapeHtml(g.title) + '</span><span style="color:var(--hint)">›</span></div>';
+    });
+    render(html);
+    app.querySelectorAll('.group-item').forEach(function (el) {
+      el.addEventListener('click', function () { selectGroup(parseInt(el.getAttribute('data-cid'), 10)); });
+    });
+  }
+
+  function selectGroup(chatId) {
+    state.chatId = chatId;
+    state.tab = 'overview';
+    loadOverview();
+  }
+
+  // ---- Asosiy ekran (tab'lar) ----
+
+  function renderShell(bodyHtml) {
+    var groupSwitch = state.groups.length > 1
+      ? '<div class="btn secondary" style="margin-bottom:10px" onclick="window.__miniapp.backToGroups()">‹ Guruhlar</div>'
+      : '';
+    var tabs = ['overview', 'settings', 'moderation'];
+    var labels = { overview: 'Umumiy', settings: 'Sozlamalar', moderation: 'Moderatsiya' };
+    var tabsHtml = '<div class="tabs">' + tabs.map(function (t) {
+      return '<div class="tab' + (state.tab === t ? ' active' : '') + '" data-tab="' + t + '">' + labels[t] + '</div>';
+    }).join('') + '</div>';
+    render(groupSwitch + tabsHtml + bodyHtml);
+    app.querySelectorAll('.tab').forEach(function (el) {
+      el.addEventListener('click', function () {
+        state.tab = el.getAttribute('data-tab');
+        if (state.tab === 'overview') loadOverview();
+        else if (state.tab === 'settings') loadSettings();
+        else if (state.tab === 'moderation') loadModeration();
+      });
+    });
+  }
+
+  window.__miniapp = {
+    backToGroups: function () { renderGroupPicker(); },
+  };
+
+  // ---- Umumiy (Overview) ----
+
+  function loadOverview() {
+    renderShell('<div class="spinner">Yuklanmoqda…</div>');
+    api('overview', { query: { chat_id: state.chatId } }).then(function (res) {
+      state.overview = res;
+      renderOverview();
+    }).catch(function (e) { renderShell('<div class="error-box">⚠️ ' + escapeHtml(e.message) + '</div>'); });
+  }
+
+  function renderOverview() {
+    var o = state.overview;
+    var planBadge = o.plan.is_premium
+      ? '<span class="badge premium">⭐ Premium</span>'
+      : '<span class="badge free">Bepul</span>';
+    var limitText = o.plan.ai_daily_limit ? (o.plan.ai_requests_today + ' / ' + o.plan.ai_daily_limit) : (o.plan.ai_requests_today + ' (chegarasiz)');
+
+    var html = '<h1>' + escapeHtml(o.group.title) + '</h1>';
+    html += '<div class="card"><h2>Tarif</h2>';
+    html += '<div class="row"><span class="label">Holat</span><span class="value">' + planBadge + '</span></div>';
+    if (o.plan.is_premium) {
+      html += '<div class="row"><span class="label">Muddati</span><span class="value">' + escapeHtml(o.plan.premium_expires_at) + '</span></div>';
+    } else {
+      html += '<div class="row"><span class="label">Bugungi AI so\'rovlar</span><span class="value">' + escapeHtml(limitText) + '</span></div>';
+    }
+    html += '</div>';
+
+    html += '<div class="card"><h2>Bugungi holat</h2>';
+    html += '<div class="row"><span class="label">Faol ogohlantirishlar</span><span class="value">' + o.moderation.active_warnings + '</span></div>';
+    html += '<div class="row"><span class="label">Ko\'rib chiqilmagan shikoyatlar</span><span class="value">' + o.moderation.pending_appeals + '</span></div>';
+    html += '<div class="row"><span class="label">Bugungi choralar</span><span class="value">' + o.moderation.actions_today + '</span></div>';
+    html += '</div>';
+
+    html += '<div class="card"><h2>Sozlamalar (qisqacha)</h2>';
+    var s = o.settings_summary;
+    html += '<div class="row"><span class="label">Anti-flood</span><span class="value">' + (s.flood_enabled ? '✅' : '⛔') + '</span></div>';
+    html += '<div class="row"><span class="label">CAPTCHA</span><span class="value">' + (s.captcha_enabled ? '✅' : '⛔') + '</span></div>';
+    html += '<div class="row"><span class="label">Media filtri</span><span class="value">' + (s.media_filter ? '✅' : '⛔') + '</span></div>';
+    html += '<div class="row"><span class="label">Til</span><span class="value">' + escapeHtml(s.language) + '</span></div>';
+    html += '</div>';
+
+    renderShell(html);
+  }
+
+  // ---- Sozlamalar ----
+
+  var TOGGLE_FIELDS = [
+    ['flood_enabled', 'Anti-flood', 'Tez-tez xabar yuboruvchilarni avtomatik mute qiladi'],
+    ['captcha_enabled', 'Yangi a\'zo CAPTCHA', 'Yangi qo\'shilganlarni "men bot emasman" tugmasi bilan tasdiqlatadi'],
+    ['media_filter', 'Media filtri', 'Rasm/video/stiker/ovozli xabarlarni AI orqali tekshiradi'],
+    ['profanity_filter', 'So\'kinish filtri', 'Haqoratli matnlarni bloklaydi'],
+    ['porn_filter', 'Nomaqbul kontent filtri', '18+ rasm/videoni bloklaydi'],
+    ['link_filter', 'Havola filtri', 'Shubhali/reklama havolalarini bloklaydi'],
+    ['profile_scan', 'Profil skaneri', 'Yangi a\'zolarning profilini 18+/bot ekanini tekshiradi'],
+    ['bot_filter', 'Ruxsatsiz botlar', 'Ruxsat etilmagan bot-akkauntlarni cheklaydi'],
+    ['history_cleanup_enabled', 'Tarixiy tozalash', 'Chetlatilgan a\'zoning oldingi xabarlarini o\'chiradi'],
+  ];
+
+  function loadSettings() {
+    renderShell('<div class="spinner">Yuklanmoqda…</div>');
+    api('settings_get', { query: { chat_id: state.chatId } }).then(function (res) {
+      state.settings = res.settings;
+      renderSettings();
+    }).catch(function (e) { renderShell('<div class="error-box">⚠️ ' + escapeHtml(e.message) + '</div>'); });
+  }
+
+  function renderSettings() {
+    var s = state.settings;
+    var html = '<div class="card"><h2>Yoqish / o\'chirish</h2>';
+    TOGGLE_FIELDS.forEach(function (f) {
+      var key = f[0], label = f[1], desc = f[2];
+      html += '<div class="toggle-row"><div><div>' + label + '</div><div class="desc">' + desc + '</div></div>'
+        + '<label class="switch"><input type="checkbox" data-field="' + key + '"' + (Number(s[key]) ? ' checked' : '') + '><span class="slider"></span></label></div>';
+    });
+    html += '</div>';
+
+    html += '<div class="card"><h2>Ogohlantirish / jazo</h2>';
+    html += '<div class="row"><span class="label">Ogohlantirish limiti</span>'
+      + '<input type="number" min="1" max="20" data-field="warn_limit" value="' + escapeHtml(s.warn_limit) + '" style="width:70px"></div>';
+    html += '<div class="row"><span class="label">1-mute davomiyligi (soniya)</span>'
+      + '<input type="number" min="60" data-field="mute_1st_duration_sec" value="' + escapeHtml(s.mute_1st_duration_sec) + '" style="width:90px"></div>';
+    html += '</div>';
+
+    html += '<div class="btn-row"><button class="btn" id="save-settings">Saqlash</button></div>';
+    html += '<div id="save-status" style="margin-top:8px;font-size:13px;color:var(--hint)"></div>';
+
+    renderShell(html);
+
+    var statusEl = document.getElementById('save-status');
+    document.getElementById('save-settings').addEventListener('click', function () {
+      var payload = {};
+      app.querySelectorAll('[data-field]').forEach(function (el) {
+        var key = el.getAttribute('data-field');
+        payload[key] = el.type === 'checkbox' ? (el.checked ? 1 : 0) : Number(el.value);
+      });
+      statusEl.textContent = 'Saqlanmoqda…';
+      api('settings_update', { body: { chat_id: state.chatId, settings: payload } }).then(function (res) {
+        state.settings = res.settings;
+        statusEl.textContent = '✅ Saqlandi';
+        if (tg && tg.HapticFeedback) { tg.HapticFeedback.notificationOccurred('success'); }
+      }).catch(function (e) { statusEl.textContent = '⚠️ ' + e.message; });
+    });
+  }
+
+  // ---- Moderatsiya (ogohlantirishlar + shikoyatlar) ----
+
+  function loadModeration() {
+    renderShell('<div class="spinner">Yuklanmoqda…</div>');
+    Promise.all([
+      api('warnings', { query: { chat_id: state.chatId } }),
+      api('appeals', { query: { chat_id: state.chatId } }),
+    ]).then(function (results) {
+      state.warnings = results[0].warnings || [];
+      state.appeals = results[1].appeals || [];
+      renderModeration();
+    }).catch(function (e) { renderShell('<div class="error-box">⚠️ ' + escapeHtml(e.message) + '</div>'); });
+  }
+
+  function displayName(item) {
+    return item.username ? '@' + item.username : (item.first_name || ('ID ' + item.user_id));
+  }
+
+  function renderModeration() {
+    var html = '<div class="card"><h2>Ko\'rib chiqilmagan shikoyatlar (' + state.appeals.length + ')</h2>';
+    if (state.appeals.length === 0) {
+      html += '<div class="empty">Hozircha yo\'q</div>';
+    } else {
+      state.appeals.forEach(function (a) {
+        html += '<div class="list-item"><div class="who">' + escapeHtml(displayName(a)) + '</div>'
+          + '<div class="meta">' + escapeHtml(a.action_type === 'ban_user' ? 'Ban' : 'Mute') + ' — ' + escapeHtml(a.recheck_reason || '') + '</div>'
+          + '<div class="btn-row">'
+          + '<button class="btn" data-appeal="' + a.id + '" data-accept="1">Qabul qilish</button>'
+          + '<button class="btn danger" data-appeal="' + a.id + '" data-accept="0">Rad etish</button>'
+          + '</div></div>';
+      });
+    }
+    html += '</div>';
+
+    html += '<div class="card"><h2>Faol ogohlantirishlar (' + state.warnings.length + ')</h2>';
+    if (state.warnings.length === 0) {
+      html += '<div class="empty">Hozircha yo\'q</div>';
+    } else {
+      state.warnings.forEach(function (w) {
+        html += '<div class="list-item"><div class="who">' + escapeHtml(displayName(w)) + '</div>'
+          + '<div class="meta">' + escapeHtml(w.reason) + ' — ' + escapeHtml(w.expires_at) + ' gacha</div>'
+          + '<div class="btn-row">'
+          + '<button class="btn secondary" data-reset="' + w.user_id + '">Ogohlantirishlarni bekor qilish</button>'
+          + '</div></div>';
+      });
+    }
+    html += '</div>';
+
+    renderShell(html);
+
+    app.querySelectorAll('[data-appeal]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        var id = parseInt(el.getAttribute('data-appeal'), 10);
+        var accept = el.getAttribute('data-accept') === '1';
+        el.setAttribute('disabled', 'disabled');
+        api('review_appeal', { body: { appeal_id: id, accept: accept } }).then(function () {
+          if (tg && tg.HapticFeedback) { tg.HapticFeedback.notificationOccurred('success'); }
+          loadModeration();
+        }).catch(function (e) { alert(e.message); loadModeration(); });
+      });
+    });
+    app.querySelectorAll('[data-reset]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        var uid = parseInt(el.getAttribute('data-reset'), 10);
+        el.setAttribute('disabled', 'disabled');
+        api('resetwarns', { body: { chat_id: state.chatId, user_id: uid } }).then(function () {
+          if (tg && tg.HapticFeedback) { tg.HapticFeedback.notificationOccurred('success'); }
+          loadModeration();
+        }).catch(function (e) { alert(e.message); loadModeration(); });
+      });
+    });
+  }
+
+  // ---- Boshlash ----
+
+  if (!initData) {
+    renderError('Bu sahifa faqat Telegram bot ichidagi Mini App sifatida ochilganda ishlaydi.');
+    return;
+  }
+  loadGroups();
+})();
+</script>
+</body>
+</html>

@@ -457,4 +457,48 @@ class TelegramClient
         $res = $this->request('answerCallbackQuery', $params);
         return (bool)($res['ok'] ?? false);
     }
+
+    /**
+     * Telegram Stars orqali hisob-faktura (invoice) yuborish (2.0 Phase 3, 2-band —
+     * monetizatsiya). `provider_token` Stars uchun ATAYLAB bo'sh qoldiriladi — bu
+     * bot ichki valyutasi, tashqi to'lov provayderi (Stripe va h.k.) shart emas.
+     * `currency: 'XTR'` — Telegram Stars uchun maxsus kod. `$amountStars` — butun
+     * son (oddiy valyutalardan farqli, 100ga ko'paytirilmaydi).
+     */
+    public function sendInvoice(
+        int|string $chatId,
+        string $title,
+        string $description,
+        string $payload,
+        int $amountStars,
+        string $priceLabel = "To'lov"
+    ): array {
+        $params = [
+            'chat_id' => $chatId,
+            'title' => $title,
+            'description' => $description,
+            'payload' => $payload,
+            'provider_token' => '',
+            'currency' => 'XTR',
+            'prices' => [['label' => $priceLabel, 'amount' => $amountStars]],
+            'reply_markup' => ['inline_keyboard' => [[['text' => "⭐ To'lash", 'pay' => true]]]],
+        ];
+        return $this->request('sendInvoice', $params);
+    }
+
+    /**
+     * Telegram `pre_checkout_query`ga javob berish — MAJBURIY, aks holda to'lov
+     * foydalanuvchi tomonidan bajarilgan taqdirda ham yakunlanmaydi. Telegram bu
+     * javobni 10 soniya ichida kutadi, shuning uchun webhook'da SINXRON (navbatga
+     * qo'ymasdan) chaqiriladi.
+     */
+    public function answerPreCheckoutQuery(string $preCheckoutQueryId, bool $ok, string $errorMessage = ''): bool
+    {
+        $params = ['pre_checkout_query_id' => $preCheckoutQueryId, 'ok' => $ok];
+        if (!$ok && $errorMessage !== '') {
+            $params['error_message'] = $errorMessage;
+        }
+        $res = $this->request('answerPreCheckoutQuery', $params);
+        return (bool)($res['ok'] ?? false);
+    }
 }

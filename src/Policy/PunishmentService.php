@@ -7,6 +7,7 @@ namespace App\Policy;
 use App\Core\Database;
 use App\Core\Logger;
 use App\Core\TelegramClient;
+use App\Core\Translator;
 use PDO;
 use Throwable;
 
@@ -104,11 +105,16 @@ class PunishmentService
         }
 
         // 6. Asosiy jazo amalini bajarish
+        // Guruh a'zosiga (shaxsiy xabar sifatida) yuboriladigan xabar guruhning
+        // tanlangan tilida (`group_settings.language`, standart 'uz') tuziladi —
+        // 2.0 Phase 3, 1-band (i18n).
+        $lang = Translator::normalizeLang(SettingsService::get($chatId)['language'] ?? null);
         $noticeText = "";
         $strike = $decision['strike_count'] ?? 1;
         $warnLimit = max(1, (int)($decision['warn_limit'] ?? 3));
         $reason = (string)($decision['reason'] ?? 'Qoidabuzarlik');
         $safeReason = htmlspecialchars($reason, ENT_QUOTES, 'UTF-8');
+        $userLink = "<a href=\"tg://user?id={$userId}\">{$userId}</a>";
         $warningKey = null;
 
         // Har bir bosqich (warn/mute) keyingi qaror uchun faol strike sifatida saqlanadi.
@@ -137,7 +143,12 @@ class PunishmentService
 
         switch ($action) {
             case 'warn_user':
-                $noticeText = "⚠️ <b>Ogohlantirish!</b>\nFoydalanuvchi: <a href=\"tg://user?id={$userId}\">{$userId}</a>\nSabab: {$safeReason}\n<i>Ogohlantirishlar: {$strike}/{$warnLimit}. Guruh qoidalariga rioya qiling!</i>";
+                $noticeText = Translator::get('punishment.warn', $lang, [
+                    'user_link' => $userLink,
+                    'reason' => $safeReason,
+                    'strike' => $strike,
+                    'limit' => $warnLimit,
+                ]);
                 break;
 
             case 'mute_user':
@@ -146,7 +157,11 @@ class PunishmentService
                 $durationHours = round($durationSec / 3600, 1);
 
                 if ($actionSuccess) {
-                    $noticeText = "🔇 <b>Vaqtincha cheklov (MUTE)!</b>\nFoydalanuvchi: <a href=\"tg://user?id={$userId}\">{$userId}</a>\nMuddat: {$durationHours} soat\nSabab: {$safeReason}";
+                    $noticeText = Translator::get('punishment.mute', $lang, [
+                        'user_link' => $userLink,
+                        'hours' => $durationHours,
+                        'reason' => $safeReason,
+                    ]);
                 } else {
                     $errors[] = "Telegram Bot API orqali foydalanuvchini mute qilib bo'lmadi";
                 }
@@ -155,7 +170,10 @@ class PunishmentService
             case 'ban_user':
                 $actionSuccess = $this->telegram->banChatMember($chatId, $userId);
                 if ($actionSuccess) {
-                    $noticeText = "🚫 <b>Guruhdan chetlatish (BAN)!</b>\nFoydalanuvchi: <a href=\"tg://user?id={$userId}\">{$userId}</a>\nSabab: {$safeReason}";
+                    $noticeText = Translator::get('punishment.ban', $lang, [
+                        'user_link' => $userLink,
+                        'reason' => $safeReason,
+                    ]);
                 } else {
                     $errors[] = "Telegram Bot API orqali foydalanuvchini ban qilib bo'lmadi";
                 }
@@ -175,14 +193,11 @@ class PunishmentService
             $appealMarkup = [
                 'reply_markup' => [
                     'inline_keyboard' => [[
-                        ['text' => '📝 Shikoyat qilish', 'callback_data' => "appeal_request:{$actionRecordId}"]
+                        ['text' => Translator::get('punishment.appeal_button', $lang), 'callback_data' => "appeal_request:{$actionRecordId}"]
                     ]]
                 ]
             ];
-            $privateNotice = $noticeText
-                . "\n\n<i>Qaror noto'g'ri deb hisoblasangiz, quyidagi tugma orqali shikoyat yuboring.</i>"
-                . "\nHarakat ID: <code>{$actionRecordId}</code>"
-                . "\nMuqobil buyruq: <code>/appeal {$actionRecordId}</code>";
+            $privateNotice = $noticeText . Translator::get('punishment.appeal_hint', $lang, ['action_id' => $actionRecordId]);
             $privateResult = $this->telegram->sendMessage($userId, $privateNotice, $appealMarkup);
             if (!($privateResult['ok'] ?? false)) {
                 Logger::warning("Shikoyat tugmasini foydalanuvchi lichkasiga yuborib bo'lmadi; foydalanuvchi avval botga /start yuborishi kerak", [

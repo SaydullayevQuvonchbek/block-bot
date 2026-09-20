@@ -13,9 +13,13 @@ use App\Audit\ReportService;
 use App\Audit\TelegramExportImporter;
 use App\Core\Config;
 use App\Core\Database;
+use App\Core\MiniAppAuth;
 use App\Core\QueueService;
 use App\Core\TelegramClient;
+use App\Http\MiniAppApiRouter;
 use App\Http\UpdateRouter;
+use App\Moderation\CaptchaGuard;
+use App\Moderation\FloodGuard;
 use App\Moderation\TextModerator;
 use App\Moderation\TextNormalizer;
 use App\Moderation\ProfileModerator;
@@ -23,6 +27,7 @@ use App\Policy\AdminAuthorizationService;
 use App\Policy\ModerationDecisionService;
 use App\Policy\PunishmentService;
 use App\Policy\SettingsService;
+use App\Policy\SubscriptionService;
 
 class ModerationBotTest extends TestCase
 {
@@ -1234,5 +1239,1858 @@ class ModerationBotTest extends TestCase
 
         $this->assertEquals('safe', $result['status']);
         $this->assertFalse($vision->called, "AI aniq xulosa bergan holatda SafeSearch chaqirilmasligi kerak");
+    }
+
+    /**
+     * 50. Anti-flood: belgilangan oyna ichida chegaradan ortiq xabar yuborgan oddiy
+     *     a'zo avtomatik (qisqa muddatga) mute qilinishi kerak.
+     */
+    public function testFloodGuardMutesFastSender(): void
+    {
+        $chatId = -100999001;
+        $userId = 555001;
+        $router = new UpdateRouter();
+
+        // Standart sozlama: 10 soniyada 6 tadan ortiq xabar = flood.
+        $lastStatus = null;
+        for ($i = 1; $i <= 7; $i++) {
+            $update = [
+                'update_id' => 99910000 + $i,
+                'message' => [
+                    'message_id' => 99920000 + $i,
+                    'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                    'from' => ['id' => $userId, 'is_bot' => false],
+                    'text' => "flood xabari {$i}",
+                ],
+            ];
+            $res = $router->handle($update);
+            $lastStatus = $res['status'];
+            if ($i <= 6) {
+                $this->assertTrue($lastStatus !== 'flood_muted', "{$i}-xabar hali chegaraga yetmagan, flood_muted bo'lmasligi kerak");
+            }
+        }
+
+        $this->assertEquals('flood_muted', $lastStatus, "7-xabar chegaradan oshgani uchun flood_muted qaytishi kerak");
+
+        $pdo = Database::getConnection();
+        $stmt = $pdo->prepare("SELECT status FROM telegram_actions WHERE chat_id = :cid AND user_id = :uid AND action_type = 'mute_user'");
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $row = $stmt->fetch();
+        $this->assertNotNull($row, "Flood sababli mute_user harakati telegram_actions'ga yozilishi kerak");
+        $this->assertEquals('executed', $row['status']);
+
+        // Flood sababli mute ogohlantirish zinapoyasiga (warn->mute->ban) qo'shilmasligi kerak.
+        $this->assertEquals(0, ModerationDecisionService::getActiveWarningsCount($chatId, $userId), "Flood mute oddiy ogohlantirish hisobiga kirmasligi kerak");
+    }
+
+    /**
+     * 51. Anti-flood adminlarga taalluqli emas — admin tez-tez yozsa ham cheklanmaydi.
+     */
+    public function testFloodGuardDoesNotMuteAdmins(): void
+    {
+        $chatId = -100999002;
+        $adminUserId = 1; // Test muhitida TelegramClient::request() userId=1 ni har doim 'creator' deb qaytaradi.
+        $router = new UpdateRouter();
+
+        for ($i = 1; $i <= 8; $i++) {
+            $update = [
+                'update_id' => 99930000 + $i,
+                'message' => [
+                    'message_id' => 99940000 + $i,
+                    'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                    'from' => ['id' => $adminUserId, 'is_bot' => false],
+                    'text' => "admin tez xabar {$i}",
+                ],
+            ];
+            $res = $router->handle($update);
+            $this->assertTrue($res['status'] !== 'flood_muted', "Admin hech qachon flood_muted olmasligi kerak (iteratsiya {$i})");
+        }
+    }
+
+    /**
+     * 52. Guruh sozlamasida flood_enabled = 0 bo'lsa, tezlik nazorati butunlay o'chadi.
+     */
+    public function testFloodDisabledSettingSkipsFloodCheck(): void
+    {
+        $chatId = -100999004;
+        $userId = 555004;
+        SettingsService::update($chatId, ['flood_enabled' => 0]);
+        $router = new UpdateRouter();
+
+        for ($i = 1; $i <= 10; $i++) {
+            $update = [
+                'update_id' => 99950000 + $i,
+                'message' => [
+                    'message_id' => 99960000 + $i,
+                    'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                    'from' => ['id' => $userId, 'is_bot' => false],
+                    'text' => "o'chirilgan flood testi {$i}",
+                ],
+            ];
+            $res = $router->handle($update);
+            $this->assertTrue($res['status'] !== 'flood_muted', "flood_enabled=0 bo'lsa flood_muted hech qachon qaytmasligi kerak (iteratsiya {$i})");
+        }
+    }
+
+    /**
+     * 53. FloodGuard past darajada: oyna muddati tugagach hisoblagich avtomatik
+     *     qayta boshlanadi (eski, chegaradan oshgan qiymat "meros" qolib ketmaydi).
+     */
+    public function testFloodGuardResetsAfterWindowExpires(): void
+    {
+        $chatId = -100999003;
+        $userId = 555003;
+        $pdo = Database::getConnection();
+        $staleWindowStart = gmdate('Y-m-d H:i:s', time() - 100);
+        $pdo->prepare("
+            INSERT INTO flood_counters (chat_id, user_id, window_start, message_count, updated_at)
+            VALUES (:cid, :uid, :ws, :cnt, :ws)
+        ")->execute(['cid' => $chatId, 'uid' => $userId, 'ws' => $staleWindowStart, 'cnt' => 50]);
+
+        $result = FloodGuard::register($chatId, $userId, 10, 6);
+
+        $this->assertFalse($result['flooding'], "Oyna muddati (10s) tugagan eski hisoblagich flood deb hisoblanmasligi kerak");
+        $this->assertEquals(1, $result['count'], "Yangi oyna 1-xabardan boshlanishi kerak");
+    }
+
+    /**
+     * 54. CAPTCHA standart holatda o'chirilgan — yangi a'zo qo'shilganda
+     *     hech qanday cheklov/tasdiqlash yozuvi yaratilmasligi kerak.
+     */
+    public function testCaptchaDisabledByDefaultDoesNotRestrictNewMember(): void
+    {
+        $chatId = -100777004;
+        $userId = 444004;
+        $router = new UpdateRouter();
+
+        $res = $router->handle([
+            'update_id' => 997020,
+            'message' => [
+                'message_id' => 5002,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 999, 'is_bot' => false],
+                'new_chat_members' => [
+                    ['id' => $userId, 'is_bot' => false, 'first_name' => 'Oddiy'],
+                ],
+            ],
+        ]);
+        $this->assertEquals('cleaned_service_message', $res['status']);
+
+        $pdo = Database::getConnection();
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM captcha_pending WHERE chat_id = :cid AND user_id = :uid");
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $this->assertEquals(0, (int)$stmt->fetchColumn(), "captcha_enabled=0 (standart) bo'lsa captcha yozuvi yaratilmasligi kerak");
+    }
+
+    /**
+     * 55. CAPTCHA yoqilgan bo'lsa: yangi a'zo qo'shilganda tasdiqlash kutilayotgan
+     *     yozuv va kechiktirilgan CaptchaTimeoutJob yaratiladi; "✅ Men botman
+     *     emas" tugmasini o'zi bosganda tasdiqlanadi.
+     */
+    public function testCaptchaRestrictsNewMemberAndVerifyButtonUnlocks(): void
+    {
+        $chatId = -100777001;
+        $userId = 444001;
+        SettingsService::update($chatId, ['captcha_enabled' => 1, 'captcha_timeout_sec' => 45]);
+
+        $router = new UpdateRouter();
+        $res = $router->handle([
+            'update_id' => 997001,
+            'message' => [
+                'message_id' => 5001,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 999, 'is_bot' => false],
+                'new_chat_members' => [
+                    ['id' => $userId, 'is_bot' => false, 'first_name' => 'Yangi', 'last_name' => 'Azo'],
+                ],
+            ],
+        ]);
+        $this->assertEquals('cleaned_service_message', $res['status']);
+
+        $pdo = Database::getConnection();
+        $stmt = $pdo->prepare("SELECT status FROM captcha_pending WHERE chat_id = :cid AND user_id = :uid");
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $row = $stmt->fetch();
+        $this->assertNotNull($row, "CAPTCHA yoqilgan bo'lsa tasdiqlash yozuvi yaratilishi kerak");
+        $this->assertEquals('pending', $row['status']);
+
+        // CaptchaTimeoutJob navbatga kechiktirilgan holda qo'yilgani (available_at kelajakda,
+        // shuning uchun QueueService::reserve() hali qaytarmaydi — to'g'ridan-to'g'ri jadvaldan tekshiramiz).
+        $jobRow = $pdo->query("SELECT payload, available_at FROM queue_jobs ORDER BY id DESC LIMIT 5")->fetchAll();
+        $foundTimeoutJob = false;
+        foreach ($jobRow as $r) {
+            $decoded = json_decode((string)$r['payload'], true);
+            if (($decoded['handler'] ?? '') === 'App\Jobs\CaptchaTimeoutJob' && (int)($decoded['data']['user_id'] ?? 0) === $userId) {
+                $foundTimeoutJob = true;
+                $this->assertTrue(strtotime((string)$r['available_at']) > time(), "CaptchaTimeoutJob kechiktirilgan (delay) bo'lishi kerak");
+            }
+        }
+        $this->assertTrue($foundTimeoutJob, "CaptchaTimeoutJob navbatga qo'yilishi kerak");
+
+        // Foydalanuvchi o'zi tugmani bosadi.
+        $verifyRes = $router->handle([
+            'update_id' => 997002,
+            'callback_query' => [
+                'id' => 'captcha-cb-1',
+                'from' => ['id' => $userId, 'first_name' => 'Yangi'],
+                'data' => "captcha_verify:{$chatId}:{$userId}",
+            ],
+        ]);
+        $this->assertEquals('captcha_verified', $verifyRes['status']);
+
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $row2 = $stmt->fetch();
+        $this->assertEquals('verified', $row2['status']);
+    }
+
+    /**
+     * 56. CAPTCHA tugmasini faqat nishonlangan (yangi qo'shilgan) foydalanuvchining
+     *     o'zi bosishi mumkin — boshqa foydalanuvchi bossa holat o'zgarmaydi.
+     */
+    public function testCaptchaVerifyRejectsDifferentUser(): void
+    {
+        $chatId = -100777002;
+        $userId = 444002;
+        $otherUserId = 444099;
+        CaptchaGuard::start($chatId, $userId, 5555, 60);
+
+        $router = new UpdateRouter();
+        $res = $router->handle([
+            'update_id' => 997010,
+            'callback_query' => [
+                'id' => 'captcha-cb-2',
+                'from' => ['id' => $otherUserId, 'first_name' => 'Boshqa'],
+                'data' => "captcha_verify:{$chatId}:{$userId}",
+            ],
+        ]);
+        $this->assertEquals('unauthorized', $res['status']);
+
+        $pdo = Database::getConnection();
+        $stmt = $pdo->prepare("SELECT status FROM captcha_pending WHERE chat_id = :cid AND user_id = :uid");
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $row = $stmt->fetch();
+        $this->assertEquals('pending', $row['status'], "Noto'g'ri foydalanuvchi bosishi holatni o'zgartirmasligi kerak");
+    }
+
+    /**
+     * 57. CaptchaTimeoutJob: foydalanuvchi vaqtida tasdiqlamasa, yozuv "kicked"ga
+     *     o'tadi (guruhdan chetlatiladi, lekin doimiy ban emas).
+     */
+    public function testCaptchaTimeoutJobKicksUnverifiedMember(): void
+    {
+        $chatId = -100777003;
+        $userId = 444003;
+        CaptchaGuard::start($chatId, $userId, 6666, 60);
+
+        (new \App\Jobs\CaptchaTimeoutJob())->handle(['chat_id' => $chatId, 'user_id' => $userId]);
+
+        $pdo = Database::getConnection();
+        $stmt = $pdo->prepare("SELECT status FROM captcha_pending WHERE chat_id = :cid AND user_id = :uid");
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $row = $stmt->fetch();
+        $this->assertEquals('kicked', $row['status']);
+
+        // Job ikkinchi marta (masalan, worker qayta urinishi) chaqirilsa ham xavfsiz — o'zgarish yo'q.
+        (new \App\Jobs\CaptchaTimeoutJob())->handle(['chat_id' => $chatId, 'user_id' => $userId]);
+        $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
+        $row2 = $stmt->fetch();
+        $this->assertEquals('kicked', $row2['status']);
+    }
+
+    /**
+     * 59. "Local" bosqichda ovozli (voice) va audio xabarlar media_filter yoqilgan bo'lsa
+     *     to'liq (AI) tahlil uchun fon navbatiga qo'yiladi.
+     */
+    public function testLocalPhaseQueuesVoiceAndAudioMessagesForFullModeration(): void
+    {
+        $chatId = -100822001;
+        SettingsService::get($chatId);
+
+        (new \App\Jobs\ModerateMessageJob())->handle([
+            'message' => [
+                'message_id' => 9001,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 80001, 'is_bot' => false],
+                'voice' => ['file_id' => 'voice_file_1', 'mime_type' => 'audio/ogg', 'duration' => 5],
+            ],
+            'is_edited' => false,
+            'chat_id' => $chatId,
+            'phase' => 'local',
+        ]);
+        $deferred = QueueService::reserve('default');
+        $this->assertNotNull($deferred, "Ovozli xabar uchun to'liq (full) tahlil navbatga qo'yilishi kerak");
+        $this->assertEquals('full', $deferred['data']['phase']);
+
+        $chatId2 = -100822002;
+        SettingsService::get($chatId2);
+        (new \App\Jobs\ModerateMessageJob())->handle([
+            'message' => [
+                'message_id' => 9002,
+                'chat' => ['id' => $chatId2, 'type' => 'supergroup'],
+                'from' => ['id' => 80002, 'is_bot' => false],
+                'audio' => ['file_id' => 'audio_file_1', 'mime_type' => 'audio/mpeg', 'duration' => 30],
+            ],
+            'is_edited' => false,
+            'chat_id' => $chatId2,
+            'phase' => 'local',
+        ]);
+        $deferred2 = QueueService::reserve('default');
+        $this->assertNotNull($deferred2, "Audio fayl uchun to'liq (full) tahlil navbatga qo'yilishi kerak");
+        $this->assertEquals('full', $deferred2['data']['phase']);
+    }
+
+    /**
+     * 60. media_filter o'chirilgan guruhda ovozli xabar uchun hech qanday tahlil
+     *     navbatga qo'yilmaydi.
+     */
+    public function testVoiceMessageSkippedWhenMediaFilterDisabled(): void
+    {
+        $chatId = -100822003;
+        SettingsService::update($chatId, ['media_filter' => false]);
+
+        (new \App\Jobs\ModerateMessageJob())->handle([
+            'message' => [
+                'message_id' => 9003,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 80003, 'is_bot' => false],
+                'voice' => ['file_id' => 'voice_file_2', 'mime_type' => 'audio/ogg', 'duration' => 5],
+            ],
+            'is_edited' => false,
+            'chat_id' => $chatId,
+            'phase' => 'local',
+        ]);
+        $this->assertNull(QueueService::reserve('default'), "media_filter o'chirilganda ovozli xabar navbatga qo'yilmasligi kerak");
+    }
+
+    /**
+     * 61. MediaModerator::inspectMedia() "voice" va "audio" turlarini AI klientning
+     *     moderateAudio() metodiga to'g'ri yo'naltiradi va natijani qaytaradi.
+     */
+    public function testMediaModeratorDispatchesVoiceAndAudioToModerateAudio(): void
+    {
+        $telegram = new class extends TelegramClient {
+            public function getFile(string $fileId): ?array
+            {
+                // Fayl kontenti fileId'ga bog'liq — har xil fileId har xil hash (kesh
+                // to'qnashuvining oldini olish uchun, chunki ikkala chaqiruv ham
+                // bitta test ichida ketma-ket ishlaydi).
+                return ['file_path' => "voice/{$fileId}.oga", 'file_size' => 500];
+            }
+            public function downloadFile(string $filePath, string $destinationPath): bool
+            {
+                file_put_contents($destinationPath, $filePath);
+                return true;
+            }
+        };
+        $ai = new class extends OpenRouterClient {
+            public array $calledWith = [];
+            public function moderateAudio(string $audioPath, string $caption = '', string $itemId = 'item_1', ?int $chatId = null, ?string $customModel = null): array
+            {
+                $this->calledWith[] = $itemId;
+                return ['item_id' => $itemId, 'status' => 'unsafe', 'category' => 'profanity', 'reason' => 'ogzaki so\'kinish', 'evidence' => 'so\'z', 'model' => 'test-audio', 'cost_usd' => 0.001];
+            }
+        };
+        $vision = new \App\AI\GoogleVisionClient();
+
+        $mediaModerator = new \App\Moderation\MediaModerator($telegram, $ai, $vision);
+
+        $voiceResult = $mediaModerator->inspectMedia('voice_file_x', 'voice', '', -100822004, 'mm_voice');
+        $this->assertEquals('unsafe', $voiceResult['status']);
+        $this->assertEquals('profanity', $voiceResult['category']);
+        $this->assertEquals('ai_audio', $voiceResult['source']);
+
+        $audioResult = $mediaModerator->inspectMedia('audio_file_x', 'audio', '', -100822004, 'mm_audio');
+        $this->assertEquals('unsafe', $audioResult['status']);
+        $this->assertEquals('ai_audio', $audioResult['source']);
+
+        $this->assertEquals(['mm_voice', 'mm_audio'], $ai->calledWith);
+    }
+
+    /**
+     * 62. OpenRouter provayderida (Gemini emas) moderateAudio() haqiqiy tarmoq so'rovisiz,
+     *     xavfsiz "unscannable" natija bilan gracious ravishda ishlaydi (bloklamaydi,
+     *     lekin adminга signal beradi).
+     */
+    public function testOpenRouterModerateAudioGracefullyDegrades(): void
+    {
+        $client = new OpenRouterClient();
+        $tmpFile = tempnam(sys_get_temp_dir(), 'voice_test_');
+        file_put_contents($tmpFile, str_repeat('x', 16));
+
+        try {
+            $result = $client->moderateAudio($tmpFile, '', 'or_audio_1');
+            $this->assertEquals('unscannable', $result['status']);
+            $this->assertEquals('audio_unsupported_provider', $result['category']);
+        } finally {
+            @unlink($tmpFile);
+        }
+    }
+
+    /**
+     * 63. WEBM video-stiker MediaModerator::inspectMedia() orqali mavjud FFmpeg
+     *     kadr-ajratish yo'liga yo'naltiriladi (avval bunday stikerlar hech qanday
+     *     tahlilsiz "unscannable/animated_sticker" deb belgilanardi).
+     */
+    public function testMediaModeratorRoutesWebmVideoStickerThroughFrameExtraction(): void
+    {
+        $probe = new \App\Moderation\MediaModerator();
+        if (!$probe->isFfmpegAvailable()) {
+            $this->markTestSkipped("FFmpeg mavjud emas — WEBM video-stiker kadr-ajratish testi o'tkazib yuborildi");
+        }
+
+        $webmPath = sys_get_temp_dir() . '/sticker_test_' . bin2hex(random_bytes(4)) . '.webm';
+        // inspectVideo() 1/3/5-soniyalardan kadr oladi — fikstura shu nuqtalarni qamrab
+        // olishi uchun yetarlicha uzun (6s) bo'lishi kerak.
+        @exec('ffmpeg -y -f lavfi -i testsrc=size=32x32:rate=2:duration=6 -c:v libvpx '
+            . escapeshellarg($webmPath) . ' 2>&1', $out, $code);
+        if ($code !== 0 || !file_exists($webmPath) || filesize($webmPath) === 0) {
+            $this->markTestSkipped("Test uchun WEBM fikstura generatsiya qilib bo'lmadi");
+        }
+        $webmBytes = (string)file_get_contents($webmPath);
+        @unlink($webmPath);
+
+        $telegram = new class extends TelegramClient {
+            public string $bytes = '';
+            public function getFile(string $fileId): ?array
+            {
+                return ['file_path' => 'stickers/test.webm', 'file_size' => strlen($this->bytes)];
+            }
+            public function downloadFile(string $filePath, string $destinationPath): bool
+            {
+                file_put_contents($destinationPath, $this->bytes);
+                return true;
+            }
+        };
+        $telegram->bytes = $webmBytes;
+
+        $ai = new class extends OpenRouterClient {
+            public int $calls = 0;
+            public function moderateImage(string $imagePath, string $caption = '', string $itemId = 'item_1', ?int $chatId = null, ?string $customModel = null): array
+            {
+                $this->calls++;
+                return ['item_id' => $itemId, 'status' => 'unsafe', 'category' => 'pornography', 'reason' => 'test', 'evidence' => '', 'model' => 'test', 'cost_usd' => 0.0];
+            }
+        };
+        $vision = new \App\AI\GoogleVisionClient();
+
+        $mediaModerator = new \App\Moderation\MediaModerator($telegram, $ai, $vision);
+        $result = $mediaModerator->inspectMedia('sticker_file_1', 'sticker', '', -100822005, 'mm_sticker_webm');
+
+        $this->assertEquals('unsafe', $result['status']);
+        $this->assertEquals('ai_vision_video_sticker', $result['source']);
+        $this->assertTrue($ai->calls > 0, "WEBM video-stiker uchun AI vision kadr tahlili chaqirilishi kerak");
+    }
+
+    /**
+     * 64. TGS (Lottie) animatsion stiker to'g'ridan-to'g'ri inspectMedia()ga kelsa
+     *     (masalan, ModerateMessageJob darajasida thumbnail-zaxira topilmagan holatda),
+     *     xavfsiz "unscannable/animated_sticker" natija bilan yakunlanadi — bloklamaydi
+     *     va AI'ga hech qanday so'rov yubormaydi (FFmpeg orqali dekodlab bo'lmaydi).
+     */
+    public function testMediaModeratorTgsStickerReturnsUnscannableWithoutCrashing(): void
+    {
+        $telegram = new class extends TelegramClient {
+            public function getFile(string $fileId): ?array
+            {
+                return ['file_path' => 'stickers/test.tgs', 'file_size' => 40];
+            }
+            public function downloadFile(string $filePath, string $destinationPath): bool
+            {
+                file_put_contents($destinationPath, str_repeat("\x1f\x8b", 20));
+                return true;
+            }
+        };
+        $ai = new class extends OpenRouterClient {
+            public int $calls = 0;
+            public function moderateImage(string $imagePath, string $caption = '', string $itemId = 'item_1', ?int $chatId = null, ?string $customModel = null): array
+            {
+                $this->calls++;
+                return ['item_id' => $itemId, 'status' => 'safe', 'category' => 'none', 'reason' => '', 'evidence' => '', 'model' => 'test', 'cost_usd' => 0.0];
+            }
+        };
+        $vision = new \App\AI\GoogleVisionClient();
+
+        $mediaModerator = new \App\Moderation\MediaModerator($telegram, $ai, $vision);
+        $result = $mediaModerator->inspectMedia('sticker_file_2', 'sticker', '', -100822006, 'mm_sticker_tgs');
+
+        $this->assertEquals('unscannable', $result['status']);
+        $this->assertEquals('animated_sticker', $result['category']);
+        $this->assertEquals(0, $ai->calls, "TGS uchun AI chaqiruvi bo'lmasligi kerak (ffmpeg orqali dekodlab bo'lmaydi)");
+    }
+
+    /**
+     * 65. /addmod orqali berilgan botning ichki "moderator" roli faqat cheklangan
+     *     buyruqlarga (/warn, /mute, /unmute, /warnings) ruxsat beradi — /ban va
+     *     /addmod/removemod kabi og'irroq/rol-boshqaruv buyruqlari unga yopiq qoladi.
+     */
+    public function testAddmodGrantsWarnMuteButBlocksBanAndRoleCommands(): void
+    {
+        $chatId = -100822007;
+        $adminId = 1; // Test rejimida TelegramClient getChatMember stubi: id=1 -> 'creator'.
+        $moderatorId = 70050;
+        $targetId = 70051;
+        SettingsService::get($chatId);
+        $router = new UpdateRouter();
+
+        // Admin moderatorni tayinlaydi (xabarga reply qilib /addmod).
+        $addResult = $router->handle([
+            'update_id' => 995001,
+            'message' => [
+                'message_id' => 20001,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $adminId, 'is_bot' => false],
+                'text' => '/addmod',
+                'reply_to_message' => ['message_id' => 20000, 'from' => ['id' => $moderatorId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('command_executed', $addResult['status']);
+        $this->assertTrue($addResult['is_moderator']);
+
+        // Moderator /mute buyurishi mumkin.
+        $muteResult = $router->handle([
+            'update_id' => 995002,
+            'message' => [
+                'message_id' => 20002,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $moderatorId, 'is_bot' => false],
+                'text' => '/mute 1',
+                'reply_to_message' => ['message_id' => 20001, 'from' => ['id' => $targetId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('command_executed', $muteResult['status']);
+        $muteCount = (int)Database::getConnection()
+            ->query("SELECT COUNT(*) FROM telegram_actions WHERE chat_id = {$chatId} AND user_id = {$targetId} AND action_type = 'mute_user'")
+            ->fetchColumn();
+        $this->assertTrue($muteCount > 0, "Moderator /mute buyrug'i haqiqatda ijro etilishi kerak");
+
+        // Lekin moderator /ban bera olmaydi.
+        $banResult = $router->handle([
+            'update_id' => 995003,
+            'message' => [
+                'message_id' => 20003,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $moderatorId, 'is_bot' => false],
+                'text' => '/ban',
+                'reply_to_message' => ['message_id' => 20001, 'from' => ['id' => $targetId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('forbidden_for_moderator', $banResult['status']);
+        $banCount = (int)Database::getConnection()
+            ->query("SELECT COUNT(*) FROM telegram_actions WHERE chat_id = {$chatId} AND user_id = {$targetId} AND action_type = 'ban_user'")
+            ->fetchColumn();
+        $this->assertEquals(0, $banCount, "Moderator /ban orqali chetlata olmasligi kerak");
+
+        // Va boshqa a'zoni moderator qila olmaydi (rol-boshqaruv buyrug'i ham yopiq).
+        $addmodByModResult = $router->handle([
+            'update_id' => 995004,
+            'message' => [
+                'message_id' => 20004,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $moderatorId, 'is_bot' => false],
+                'text' => '/addmod',
+                'reply_to_message' => ['message_id' => 20001, 'from' => ['id' => $targetId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('forbidden_for_moderator', $addmodByModResult['status']);
+    }
+
+    /**
+     * 66. /removemod moderator huquqini bekor qiladi — shundan keyin sobiq moderator
+     *     endi /mute kabi buyruqlarni bera olmaydi (oddiy a'zo sifatida javobsiz qoladi).
+     */
+    public function testRemovemodRevokesModeratorPrivileges(): void
+    {
+        $chatId = -100822008;
+        $adminId = 1;
+        $moderatorId = 70060;
+        $targetId = 70061;
+        SettingsService::get($chatId);
+        $router = new UpdateRouter();
+
+        AdminAuthorizationService::setModeratorRole($chatId, $moderatorId, true);
+        $auth = new AdminAuthorizationService();
+        $this->assertTrue($auth->isModerator($chatId, $moderatorId));
+
+        $removeResult = $router->handle([
+            'update_id' => 995010,
+            'message' => [
+                'message_id' => 20010,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $adminId, 'is_bot' => false],
+                'text' => '/removemod',
+                'reply_to_message' => ['message_id' => 20009, 'from' => ['id' => $moderatorId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('command_executed', $removeResult['status']);
+        $this->assertFalse($removeResult['is_moderator']);
+        $this->assertFalse((new AdminAuthorizationService())->isModerator($chatId, $moderatorId));
+
+        $muteAttempt = $router->handle([
+            'update_id' => 995011,
+            'message' => [
+                'message_id' => 20011,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $moderatorId, 'is_bot' => false],
+                'text' => '/mute 1',
+                'reply_to_message' => ['message_id' => 20010, 'from' => ['id' => $targetId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertTrue($muteAttempt['status'] !== 'command_executed', "Moderator huquqi bekor qilingandan keyin /mute ishlamasligi kerak");
+    }
+
+    /**
+     * 67. /addmod allaqachon to'liq admin bo'lgan foydalanuvchiga qo'llanilsa,
+     *     hech narsa o'zgartirmaydi (alohida moderator huquqi keraksiz).
+     */
+    public function testAddmodOnExistingAdminIsNoop(): void
+    {
+        $chatId = -100822009;
+        $adminId = 1;
+        SettingsService::get($chatId);
+        $router = new UpdateRouter();
+
+        $result = $router->handle([
+            'update_id' => 995020,
+            'message' => [
+                'message_id' => 20020,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $adminId, 'is_bot' => false],
+                'text' => '/addmod',
+                // O'ziga (creator sifatida aniqlanadigan id=1 foydalanuvchiga) reply.
+                'reply_to_message' => ['message_id' => 20019, 'from' => ['id' => 1, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('already_admin', $result['status']);
+        $this->assertFalse((new AdminAuthorizationService())->isModerator($chatId, 1));
+    }
+
+    /**
+     * 68. HealthCheck::runChecks() DB/navbat muammosi bo'lmasa va "jonlik" belgisi
+     *     hali umuman yozilmagan bo'lsa ham (masalan, worker/cron yangi versiyani hali
+     *     ishga tushirmagan) tizimni sog'lom deb hisoblaydi.
+     */
+    public function testHealthCheckHeartbeatMissingIsTreatedAsHealthy(): void
+    {
+        $heartbeatFile = \App\Core\HealthCheck::heartbeatFile();
+        if (file_exists($heartbeatFile)) {
+            unlink($heartbeatFile);
+        }
+
+        $result = \App\Core\HealthCheck::runChecks();
+
+        $this->assertTrue($result['healthy']);
+        $this->assertTrue($result['checks']['worker_heartbeat']['ok']);
+        $this->assertNull($result['checks']['worker_heartbeat']['age_seconds']);
+    }
+
+    /**
+     * 69. Yangi yozilgan "jonlik" belgisi tizimni sog'lom deb ko'rsatadi, eskirgan
+     *     (masalan, 500 soniya oldingi) belgi esa "worker/cron to'xtagan" deb ushlaydi.
+     */
+    public function testHealthCheckHeartbeatFreshVsStale(): void
+    {
+        $heartbeatFile = \App\Core\HealthCheck::heartbeatFile();
+        try {
+            \App\Core\HealthCheck::writeHeartbeat();
+            $fresh = \App\Core\HealthCheck::runChecks();
+            $this->assertTrue($fresh['checks']['worker_heartbeat']['ok']);
+            $this->assertTrue($fresh['healthy']);
+
+            file_put_contents($heartbeatFile, (string)(time() - 500));
+            $stale = \App\Core\HealthCheck::runChecks();
+            $this->assertFalse($stale['checks']['worker_heartbeat']['ok']);
+            $this->assertFalse($stale['healthy']);
+        } finally {
+            if (file_exists($heartbeatFile)) {
+                unlink($heartbeatFile);
+            }
+        }
+    }
+
+    /**
+     * 70. Navbatda uzoq vaqt (masalan, 400 soniya) kutayotgan bajarilmagan vazifa
+     *     bo'lsa, HealthCheck buni "worker/cron ishlamayapti" deb aniqlaydi.
+     */
+    public function testHealthCheckDetectsStuckQueueJob(): void
+    {
+        $pdo = Database::getConnection();
+        $oldTimestamp = gmdate('Y-m-d H:i:s', time() - 400);
+        $pdo->prepare("
+            INSERT INTO queue_jobs (queue, priority, payload, attempts, reserved_at, available_at, created_at)
+            VALUES ('default', 10, :payload, 0, NULL, :avail, :now)
+        ")->execute([
+            'payload' => json_encode(['handler' => 'App\\Jobs\\ModerateMessageJob', 'data' => []]),
+            'avail' => $oldTimestamp,
+            'now' => $oldTimestamp,
+        ]);
+
+        $result = \App\Core\HealthCheck::runChecks();
+
+        $this->assertFalse($result['checks']['queue']['ok']);
+        $this->assertFalse($result['healthy']);
+        $this->assertTrue($result['checks']['queue']['pending'] > 0);
+    }
+
+    /**
+     * 71. Gorizontal-scaling: bir nechta worker (masalan WORKER_ID=1, WORKER_ID=2 bilan
+     *     ishga tushirilgan alohida jarayonlar) o'z-o'zidan alohida "jonlik" fayllariga
+     *     yozadi. Kamida bittasi jonli bo'lsa tizim umuman "sog'lom" hisoblanadi (navbat
+     *     baribir tozalanadi), lekin har bir workerning holati `workers` ro'yxatida
+     *     alohida ko'rinadi. Ikkalasi ham eskirgan bo'lsagina umuman nosog'lom bo'ladi.
+     */
+    public function testHealthCheckAggregatesMultipleWorkerHeartbeats(): void
+    {
+        $defaultFile = \App\Core\HealthCheck::heartbeatFile('default');
+        $w1File = \App\Core\HealthCheck::heartbeatFile('w1');
+        $w2File = \App\Core\HealthCheck::heartbeatFile('w2');
+
+        foreach ([$defaultFile, $w1File, $w2File] as $f) {
+            if (file_exists($f)) {
+                unlink($f);
+            }
+        }
+
+        try {
+            file_put_contents($w1File, (string)time());
+            file_put_contents($w2File, (string)(time() - 500)); // eskirgan
+
+            $result = \App\Core\HealthCheck::runChecks();
+
+            $this->assertTrue($result['checks']['worker_heartbeat']['ok']);
+            $this->assertTrue($result['healthy']);
+            $this->assertEquals(2, count($result['checks']['worker_heartbeat']['workers']));
+
+            // Ikkalasi ham eskirgan bo'lsa - butunlay nosog'lom
+            file_put_contents($w1File, (string)(time() - 500));
+            $result2 = \App\Core\HealthCheck::runChecks();
+            $this->assertFalse($result2['checks']['worker_heartbeat']['ok']);
+            $this->assertFalse($result2['healthy']);
+        } finally {
+            foreach ([$defaultFile, $w1File, $w2File] as $f) {
+                if (file_exists($f)) {
+                    unlink($f);
+                }
+            }
+        }
+    }
+
+    /**
+     * 72. Logger: log fayli belgilangan hajmdan (LOG_MAX_SIZE_BYTES) oshsa, avtomatik
+     *     ravishda `.1` backup faylga aylanadi va joriy fayl bo'shatiladi — shu orqali
+     *     storage/logs/*.log cheksiz o'sib ketishining (Phase 2 roadmap bandi) oldi olinadi.
+     */
+    public function testLoggerRotatesLogFileWhenSizeExceedsLimit(): void
+    {
+        $dir = sys_get_temp_dir() . '/blockbot_test_logs_' . uniqid();
+        mkdir($dir, 0755, true);
+
+        Config::set('LOG_MAX_SIZE_BYTES', 200);
+        Config::set('LOG_MAX_BACKUPS', 5);
+        Config::set('LOG_COMPRESS_BACKUPS', false);
+
+        $channel = 'rotate_test';
+        $logFile = $dir . '/' . $channel . '.log';
+
+        try {
+            \App\Core\Logger::init($dir);
+
+            // Har biri ~55 bayt bo'lgan yozuvlar — 200 baytlik chegaradan albatta oshadi
+            for ($i = 0; $i < 10; $i++) {
+                \App\Core\Logger::info(str_repeat('x', 50), [], $channel);
+            }
+
+            $this->assertTrue(is_file($logFile . '.1'), "Rotatsiyadan keyin .1 backup fayli bo'lishi kerak");
+            clearstatcache(true, $logFile);
+            $this->assertTrue(filesize($logFile) < 200, "Rotatsiyadan keyingi joriy fayl kichik bo'lishi kerak");
+        } finally {
+            Config::set('LOG_MAX_SIZE_BYTES', 10 * 1024 * 1024);
+            Config::set('LOG_MAX_BACKUPS', 5);
+            Config::set('LOG_COMPRESS_BACKUPS', true);
+            \App\Core\Logger::init(); // standart papkaga qaytarish
+            $this->removeTestLogDir($dir);
+        }
+    }
+
+    /**
+     * 73. Logger: backuplar soni LOG_MAX_BACKUPS'dan oshmasligi kerak — eng eski
+     *     backup har safar yangi rotatsiyada butunlay o'chirilib boriladi.
+     */
+    public function testLoggerEnforcesMaxBackupCount(): void
+    {
+        $dir = sys_get_temp_dir() . '/blockbot_test_logs_' . uniqid();
+        mkdir($dir, 0755, true);
+
+        Config::set('LOG_MAX_SIZE_BYTES', 100);
+        Config::set('LOG_MAX_BACKUPS', 2);
+        Config::set('LOG_COMPRESS_BACKUPS', false);
+
+        $channel = 'rotate_limit_test';
+        $logFile = $dir . '/' . $channel . '.log';
+
+        try {
+            \App\Core\Logger::init($dir);
+
+            // Har bir yozuv chegaradan oshadi -> ko'p marta rotatsiyani majburlaymiz
+            for ($i = 0; $i < 30; $i++) {
+                \App\Core\Logger::info(str_repeat('y', 80), [], $channel);
+            }
+
+            $this->assertTrue(is_file($logFile . '.1'));
+            $this->assertTrue(is_file($logFile . '.2'));
+            $this->assertFalse(is_file($logFile . '.3'), "LOG_MAX_BACKUPS=2 bo'lganda .3 backup bo'lmasligi kerak");
+        } finally {
+            Config::set('LOG_MAX_SIZE_BYTES', 10 * 1024 * 1024);
+            Config::set('LOG_MAX_BACKUPS', 5);
+            Config::set('LOG_COMPRESS_BACKUPS', true);
+            \App\Core\Logger::init();
+            $this->removeTestLogDir($dir);
+        }
+    }
+
+    private function removeTestLogDir(string $dir): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+        $files = glob($dir . '/*') ?: [];
+        foreach ($files as $file) {
+            @unlink($file);
+        }
+        @rmdir($dir);
+    }
+
+    /**
+     * 74. App\Core\Translator: standart holatda 'uz', noma'lum til kodi 'uz'ga
+     *     tushadi, va tanlangan tilda topilmagan kalit standart tilga (undan
+     *     ham topilmasa kalitning o'ziga) tushib qoladi — hech qachon xato bermaydi.
+     */
+    public function testTranslatorFallsBackToDefaultForUnsupportedLanguageAndMissingKey(): void
+    {
+        $this->assertEquals('uz', \App\Core\Translator::normalizeLang(null));
+        $this->assertEquals('uz', \App\Core\Translator::normalizeLang('xx'));
+        $this->assertEquals('ru', \App\Core\Translator::normalizeLang('RU'));
+
+        $uzText = \App\Core\Translator::get('captcha.button', 'uz');
+        $unknownLangText = \App\Core\Translator::get('captcha.button', 'xx');
+        $this->assertEquals($uzText, $unknownLangText, "Noma'lum til kodi standart ('uz')ga tushishi kerak");
+
+        $missingKey = \App\Core\Translator::get('bu.kalit.hech.qayerda.yoq', 'ru');
+        $this->assertEquals('bu.kalit.hech.qayerda.yoq', $missingKey, "Hech qayerda topilmagan kalit o'zini qaytarishi kerak");
+
+        $withParams = \App\Core\Translator::get('captcha.welcome', 'en', ['name' => 'Ali', 'timeout' => 45]);
+        $this->assertStringContainsString('Ali', $withParams);
+        $this->assertStringContainsString('45', $withParams);
+    }
+
+    /**
+     * 75. CAPTCHA guruh a'zolariga ko'rinadigan xabarlari (xush kelibsiz matni +
+     *     tugma) guruhning tanlangan tiliga ('ru') mos ravishda yuboriladi.
+     */
+    public function testCaptchaMessagesUseGroupLanguage(): void
+    {
+        $chatId = -100777099;
+        $userId = 444099;
+        SettingsService::update($chatId, ['captcha_enabled' => 1, 'captcha_timeout_sec' => 30, 'language' => 'ru']);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'text' => $text, 'extra' => $extra];
+                return ['ok' => true, 'result' => ['message_id' => 88099]];
+            }
+        };
+        $router = new UpdateRouter($telegram);
+        $router->handle([
+            'update_id' => 995099,
+            'message' => [
+                'message_id' => 6099,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 999, 'is_bot' => false],
+                'new_chat_members' => [
+                    ['id' => $userId, 'is_bot' => false, 'first_name' => 'New'],
+                ],
+            ],
+        ]);
+
+        $captchaMessages = array_values(array_filter($telegram->sent, static fn (array $m): bool => $m['chat_id'] === $chatId));
+        $this->assertTrue(count($captchaMessages) > 0, "CAPTCHA xabari yuborilishi kerak");
+        $this->assertStringContainsString('добро пожаловать', $captchaMessages[0]['text']);
+        $buttonJson = json_encode($captchaMessages[0]['extra'], JSON_UNESCAPED_UNICODE);
+        $this->assertStringContainsString('Я не бот', (string)$buttonJson);
+    }
+
+    /**
+     * 76. Jazo (mute/ban) xabari foydalanuvchiga guruhning tanlangan tilida ('ru')
+     *     yuboriladi — App\Core\Translator orqali PunishmentService.
+     */
+    public function testPunishmentNoticeUsesGroupLanguage(): void
+    {
+        $chatId = -100777199;
+        $userId = 555199;
+        SettingsService::update($chatId, ['language' => 'ru']);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function deleteMessage(int|string $chatId, int $messageId): bool { return true; }
+            public function muteUser(int|string $chatId, int $userId, int $durationSeconds = 3600): bool { return true; }
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'text' => $text, 'extra' => $extra];
+                return ['ok' => true, 'result' => ['message_id' => 88199]];
+            }
+        };
+        $service = new PunishmentService($telegram, new AdminAuthorizationService($telegram));
+        $service->execute($chatId, $userId, 9199, [
+            'action' => 'mute_user', 'delete_message' => false, 'reason' => 'Spam',
+            'strike_count' => 2, 'mute_duration_sec' => 3600,
+        ]);
+
+        $privateMessages = array_values(array_filter($telegram->sent, static fn (array $m): bool => $m['chat_id'] === $userId));
+        $this->assertEquals(1, count($privateMessages));
+        $this->assertStringContainsString('Временное ограничение', $privateMessages[0]['text']);
+        $this->assertStringContainsString('Подать апелляцию', (string)json_encode($privateMessages[0]['extra'], JSON_UNESCAPED_UNICODE));
+    }
+
+    /**
+     * 77. DM buyrug'i /til — argumentsiz joriy tilni ko'rsatadi, `/til ru` bilan
+     *     guruh tilini o'zgartiradi, noto'g'ri kod bilan xato xabar beradi.
+     */
+    public function testLanguageCommandShowsAndChangesGroupLanguage(): void
+    {
+        $chatId = -100888299;
+        SettingsService::get($chatId);
+        (new AdminAuthorizationService())->isAdmin($chatId, 1);
+        $router = new UpdateRouter();
+
+        $show = $router->handle([
+            'update_id' => 996299,
+            'message' => ['message_id' => 7299, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/til {$chatId}"],
+        ]);
+        $this->assertEquals('command_executed', $show['status']);
+        $this->assertEquals('uz', SettingsService::get($chatId)['language'], "Standart til 'uz' bo'lishi kerak");
+
+        $invalid = $router->handle([
+            'update_id' => 996300,
+            'message' => ['message_id' => 7300, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/til {$chatId} fr"],
+        ]);
+        $this->assertEquals('invalid_language', $invalid['status']);
+        $this->assertEquals('uz', SettingsService::get($chatId)['language'], "Noto'g'ri kod tilni o'zgartirmasligi kerak");
+
+        $change = $router->handle([
+            'update_id' => 996301,
+            'message' => ['message_id' => 7301, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/til {$chatId} ru"],
+        ]);
+        $this->assertEquals('command_executed', $change['status']);
+        $this->assertEquals('ru', SettingsService::get($chatId)['language']);
+    }
+
+    /**
+     * Bepul/premium tarif uchun yordamchi: berilgan guruhga bugungi kun uchun
+     * $count ta ai_usage yozuvini qo'shadi (SubscriptionService::canUseAi()
+     * chegarasini simulyatsiya qilish uchun).
+     */
+    private function seedAiUsage(int $chatId, int $count): void
+    {
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        $stmt = $pdo->prepare("
+            INSERT INTO ai_usage (chat_id, model, request_type, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd, is_estimated, created_at)
+            VALUES (:cid, 'test-model', 'text', 10, 10, 20, 0.0001, 1, :now)
+        ");
+        for ($i = 0; $i < $count; $i++) {
+            $stmt->execute(['cid' => $chatId, 'now' => $now]);
+        }
+    }
+
+    /**
+     * 78. SubscriptionService::canUseAi() — bepul tarifda kunlik chegaradan
+     *     oshgach false qaytaradi, premium guruh uchun har doim true bo'ladi
+     *     (2.0 Phase 3, 2-band — Telegram Stars monetizatsiya).
+     */
+    public function testSubscriptionServiceEnforcesFreeTierDailyLimitAndPremiumBypass(): void
+    {
+        $chatId = -100888399;
+        $oldLimit = (string)Config::get('FREE_TIER_DAILY_AI_REQUESTS', '');
+        Config::set('FREE_TIER_DAILY_AI_REQUESTS', '5');
+        try {
+            SettingsService::get($chatId);
+            $this->assertTrue(SubscriptionService::canUseAi($chatId), "Chegaraga yetmagan holatda AI ishlatish ruxsat etilishi kerak");
+
+            $this->seedAiUsage($chatId, 5);
+            $this->assertEquals(5, SubscriptionService::dailyAiRequestCount($chatId));
+            $this->assertFalse(SubscriptionService::canUseAi($chatId), "Kunlik chegaradan oshgach AI ishlatish taqiqlanishi kerak");
+
+            SubscriptionService::activatePremium($chatId, 30);
+            $this->assertTrue(SubscriptionService::canUseAi($chatId), "Premium guruh uchun chegara qo'llanilmasligi kerak");
+            $plan = SubscriptionService::getPlan($chatId);
+            $this->assertEquals('premium', $plan['plan']);
+            $this->assertTrue($plan['is_premium']);
+        } finally {
+            Config::set('FREE_TIER_DAILY_AI_REQUESTS', $oldLimit);
+        }
+    }
+
+    /**
+     * 79. Kunlik chegaradan oshgan guruh uchun OpenRouterClient::moderateText()
+     *     tarmoqqa umuman murojaat qilmasdan 'free_tier_limit_reached' natijasini
+     *     qaytaradi — AI mijozlaridagi bir yagona to'siq nuqtasi to'g'ri ulanganini
+     *     tekshiradi (2.0 Phase 3, 2-band).
+     */
+    public function testAiClientReturnsFreeTierLimitReachedWhenDailyLimitExceeded(): void
+    {
+        $chatId = -100888499;
+        $oldLimit = (string)Config::get('FREE_TIER_DAILY_AI_REQUESTS', '');
+        $oldKey = (string)Config::get('OPENROUTER_API_KEY', '');
+        Config::set('FREE_TIER_DAILY_AI_REQUESTS', '3');
+        Config::set('OPENROUTER_API_KEY', 'sk-or-v1-testkey12345678901234567890');
+        try {
+            SettingsService::get($chatId);
+            $this->seedAiUsage($chatId, 3);
+
+            $client = new OpenRouterClient();
+            $result = $client->moderateText('salom', 'item_free_tier', $chatId);
+            $this->assertEquals('review', $result['status']);
+            $this->assertEquals('free_tier_limit_reached', $result['category']);
+            $this->assertEquals('none', $result['model']);
+            $this->assertEquals(0.0, $result['cost_usd']);
+
+            // chatId berilmasa (masalan shaxsiy chat AI so'rovlari) — SubscriptionService
+            // chaqirilmaydi, chegara qo'llanmaydi (tarmoq so'rovi yubormasdan tekshiriladi).
+            $this->assertTrue(SubscriptionService::canUseAi($chatId) === false);
+        } finally {
+            Config::set('FREE_TIER_DAILY_AI_REQUESTS', $oldLimit);
+            Config::set('OPENROUTER_API_KEY', $oldKey);
+        }
+    }
+
+    /**
+     * 80. SubscriptionService::recordStarPayment() bir xil telegram_payment_charge_id
+     *     bilan ikki marta chaqirilsa, premium FAQAT bir marta beriladi (idempotency);
+     *     yangi charge_id bilan qayta sotib olish esa QOLGAN muddatga USTAMA qiladi
+     *     (stacking) — 2.0 Phase 3, 2-band.
+     */
+    public function testRecordStarPaymentIsIdempotentAndStacksOnRepeatPurchase(): void
+    {
+        $chatId = -100888599;
+        SettingsService::get($chatId);
+
+        $first = SubscriptionService::recordStarPayment($chatId, 1, 'charge_abc_001', 200, 30, 'premium_v1:' . $chatId . ':30');
+        $this->assertTrue($first['recorded']);
+        $expiryAfterFirst = $first['premium_expires_at'];
+        $this->assertNotNull($expiryAfterFirst);
+
+        // Xuddi shu charge_id bilan takroriy chaqiruv — dublikat, muddat o'zgarmaydi.
+        $duplicate = SubscriptionService::recordStarPayment($chatId, 1, 'charge_abc_001', 200, 30, 'premium_v1:' . $chatId . ':30');
+        $this->assertFalse($duplicate['recorded']);
+        $this->assertEquals($expiryAfterFirst, $duplicate['premium_expires_at']);
+
+        // Yangi charge_id — muddat hali tugamagan bo'lgani uchun QOLGAN kunlarga ustama qilinadi.
+        $second = SubscriptionService::recordStarPayment($chatId, 1, 'charge_abc_002', 200, 30, 'premium_v1:' . $chatId . ':30');
+        $this->assertTrue($second['recorded']);
+        $this->assertTrue(strtotime((string)$second['premium_expires_at']) > strtotime((string)$expiryAfterFirst),
+            "Muddatidan oldin qayta sotib olish qolgan kunlarni yo'qotmasligi (stacking) kerak");
+    }
+
+    /**
+     * 81. DM buyrug'i /premium — bepul tarifda bugungi AI ishlatish sonini va
+     *     "Premium sotib olish" tugmasini, premium tarifda esa tugash sanasini
+     *     ko'rsatadi (2.0 Phase 3, 2-band).
+     */
+    public function testPremiumStatusCommandShowsFreeAndPremiumStates(): void
+    {
+        $chatId = -100888699;
+        SettingsService::get($chatId);
+        (new AdminAuthorizationService())->isAdmin($chatId, 1);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'text' => $text, 'extra' => $extra];
+                return ['ok' => true, 'result' => ['message_id' => 88699]];
+            }
+        };
+        $router = new UpdateRouter($telegram);
+
+        $free = $router->handle([
+            'update_id' => 996699,
+            'message' => ['message_id' => 7699, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/premium {$chatId}"],
+        ]);
+        $this->assertEquals('premium_status_shown', $free['status']);
+        $this->assertEquals('free', $free['plan']);
+        $lastMsg = end($telegram->sent);
+        $this->assertStringContainsString('Bepul', $lastMsg['text']);
+        $this->assertStringContainsString("buy_premium:{$chatId}", (string)json_encode($lastMsg['extra'], JSON_UNESCAPED_UNICODE));
+
+        SubscriptionService::activatePremium($chatId, 30);
+        $premium = $router->handle([
+            'update_id' => 996700,
+            'message' => ['message_id' => 7700, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => "/premium {$chatId}"],
+        ]);
+        $this->assertEquals('premium_status_shown', $premium['status']);
+        $this->assertEquals('premium', $premium['plan']);
+        $lastMsg2 = end($telegram->sent);
+        $this->assertStringContainsString('Premium', $lastMsg2['text']);
+    }
+
+    /**
+     * 82. "⭐ Premium sotib olish" tugmasi (callback_data: "buy_premium:{chatId}")
+     *     bosilganda faqat guruh admini uchun to'g'ri payload
+     *     ("premium_v1:{chatId}:{days}") bilan Stars invoysi yuboriladi
+     *     (2.0 Phase 3, 2-band).
+     */
+    public function testBuyPremiumCallbackSendsInvoiceWithCorrectPayload(): void
+    {
+        $chatId = -100888799;
+        SettingsService::get($chatId);
+        (new AdminAuthorizationService())->isAdmin($chatId, 1);
+
+        $telegram = new class extends TelegramClient {
+            public array $invoices = [];
+            public array $answered = [];
+            public function sendInvoice(int|string $chatId, string $title, string $description, string $payload, int $amountStars, string $priceLabel = "To'lov"): array
+            {
+                $this->invoices[] = ['chat_id' => (int)$chatId, 'payload' => $payload, 'stars' => $amountStars];
+                return ['ok' => true, 'result' => true];
+            }
+            public function answerCallbackQuery(string $callbackQueryId, string $text = '', bool $showAlert = false): bool
+            {
+                $this->answered[] = $callbackQueryId;
+                return true;
+            }
+        };
+        $router = new UpdateRouter($telegram);
+
+        $result = $router->handle([
+            'update_id' => 996799,
+            'callback_query' => [
+                'id' => 'cbq_premium_799',
+                'from' => ['id' => 1, 'is_bot' => false],
+                'data' => "buy_premium:{$chatId}",
+                'message' => ['message_id' => 8799, 'chat' => ['id' => 1]],
+            ],
+        ]);
+
+        $this->assertEquals('invoice_sent', $result['status']);
+        $this->assertEquals(1, count($telegram->invoices));
+        // Invoys guruhga emas, admin bosgan SHAXSIY chatga (userId) yuboriladi —
+        // premiumning qaysi guruhga tegishli ekani payload ichida saqlanadi.
+        $this->assertEquals(1, $telegram->invoices[0]['chat_id']);
+        $this->assertEquals("premium_v1:{$chatId}:30", $telegram->invoices[0]['payload']);
+        $this->assertEquals(200, $telegram->invoices[0]['stars']);
+    }
+
+    /**
+     * 83. pre_checkout_query: to'g'ri formatdagi payload qabul qilinadi (ok=true),
+     *     noma'lum/buzilgan payload rad etiladi (ok=false) — 10 soniyalik javob
+     *     talabiga mos, sinxron va tarmoqqa chiqmasdan (2.0 Phase 3, 2-band).
+     */
+    public function testPreCheckoutQueryAcceptsValidAndRejectsInvalidPayload(): void
+    {
+        $telegram = new class extends TelegramClient {
+            public array $answers = [];
+            public function answerPreCheckoutQuery(string $preCheckoutQueryId, bool $ok, string $errorMessage = ''): bool
+            {
+                $this->answers[] = ['id' => $preCheckoutQueryId, 'ok' => $ok];
+                return true;
+            }
+        };
+        $router = new UpdateRouter($telegram);
+
+        $valid = $router->handle([
+            'update_id' => 996899,
+            'pre_checkout_query' => ['id' => 'pcq_valid_899', 'from' => ['id' => 1], 'invoice_payload' => 'premium_v1:-100888899:30'],
+        ]);
+        $this->assertEquals('pre_checkout_accepted', $valid['status']);
+
+        $invalid = $router->handle([
+            'update_id' => 996900,
+            'pre_checkout_query' => ['id' => 'pcq_invalid_900', 'from' => ['id' => 1], 'invoice_payload' => 'garbage_payload'],
+        ]);
+        $this->assertEquals('pre_checkout_rejected', $invalid['status']);
+
+        $this->assertEquals(2, count($telegram->answers));
+        $this->assertTrue($telegram->answers[0]['ok']);
+        $this->assertFalse($telegram->answers[1]['ok']);
+    }
+
+    /**
+     * 84. successful_payment (shaxsiy chatda kelgan) — payloaddagi guruh ID'siga
+     *     premiumni beradi va telegram_payment_charge_id bo'yicha idempotent
+     *     ishlaydi (takroriy webhook premium muddatini qayta uzaytirmaydi)
+     *     — 2.0 Phase 3, 2-band.
+     */
+    public function testSuccessfulPaymentActivatesPremiumAndIsIdempotent(): void
+    {
+        $chatId = -100888999;
+        SettingsService::get($chatId);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'text' => $text];
+                return ['ok' => true, 'result' => ['message_id' => 88999]];
+            }
+        };
+        $router = new UpdateRouter($telegram);
+        $payment = [
+            'currency' => 'XTR',
+            'total_amount' => 200,
+            'invoice_payload' => "premium_v1:{$chatId}:30",
+            'telegram_payment_charge_id' => 'charge_success_999',
+        ];
+
+        $first = $router->handle([
+            'update_id' => 996999,
+            'message' => ['message_id' => 7999, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'successful_payment' => $payment],
+        ]);
+        $this->assertEquals('payment_recorded', $first['status']);
+        $this->assertTrue(SubscriptionService::getPlan($chatId)['is_premium']);
+        $expiryAfterFirst = SubscriptionService::getPlan($chatId)['premium_expires_at'];
+
+        $duplicate = $router->handle([
+            'update_id' => 997000,
+            'message' => ['message_id' => 8000, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'successful_payment' => $payment],
+        ]);
+        $this->assertEquals('payment_already_recorded', $duplicate['status']);
+        $this->assertEquals($expiryAfterFirst, SubscriptionService::getPlan($chatId)['premium_expires_at']);
+    }
+
+    /**
+     * Yordamchi: Telegram Mini App'ning haqiqiy `initData` formatini (rasmiy
+     * validatsiya algoritmiga muvofiq HMAC-SHA256 imzo bilan) qo'lda yasaydi —
+     * 2.0 Phase 3, 3-band (Web Dashboard / Mini App) testlari uchun.
+     */
+    private function buildInitData(array $userData, string $botToken, ?int $authDate = null): string
+    {
+        $fields = [
+            'auth_date' => (string)($authDate ?? time()),
+            'query_id' => 'AAHtestQueryId',
+            'user' => json_encode($userData, JSON_UNESCAPED_UNICODE),
+        ];
+        ksort($fields);
+        $pairs = [];
+        foreach ($fields as $k => $v) {
+            $pairs[] = "{$k}={$v}";
+        }
+        $secretKey = hash_hmac('sha256', $botToken, 'WebAppData', true);
+        $fields['hash'] = hash_hmac('sha256', implode("\n", $pairs), $secretKey);
+
+        $query = [];
+        foreach ($fields as $k => $v) {
+            $query[] = $k . '=' . rawurlencode((string)$v);
+        }
+        return implode('&', $query);
+    }
+
+    /**
+     * 85. MiniAppAuth::verify() — to'g'ri imzolangan initData qabul qilinadi
+     *     (foydalanuvchi ID'si to'g'ri chiqariladi); buzilgan imzo va juda eski
+     *     `auth_date` rad etiladi (2.0 Phase 3, 3-band).
+     */
+    public function testMiniAppAuthVerifiesValidRejectsTamperedAndExpired(): void
+    {
+        $oldToken = (string)Config::get('TELEGRAM_BOT_TOKEN', '');
+        Config::set('TELEGRAM_BOT_TOKEN', 'test-bot-token-mini-app-85');
+        try {
+            $valid = $this->buildInitData(['id' => 555001, 'first_name' => 'Ali', 'username' => 'ali_dev'], 'test-bot-token-mini-app-85');
+            $ctx = MiniAppAuth::verify($valid);
+            $this->assertNotNull($ctx);
+            $this->assertEquals(555001, $ctx['user_id']);
+            $this->assertEquals('ali_dev', $ctx['username']);
+
+            $tampered = $valid . 'X';
+            $this->assertNull(MiniAppAuth::verify($tampered));
+
+            $wrongSecret = $this->buildInitData(['id' => 555001, 'first_name' => 'Ali'], 'boshqa-bot-tokeni');
+            $this->assertNull(MiniAppAuth::verify($wrongSecret));
+
+            $expired = $this->buildInitData(['id' => 555001, 'first_name' => 'Ali'], 'test-bot-token-mini-app-85', time() - 90000);
+            $this->assertNull(MiniAppAuth::verify($expired));
+
+            $this->assertNull(MiniAppAuth::verify(''));
+        } finally {
+            Config::set('TELEGRAM_BOT_TOKEN', $oldToken);
+        }
+    }
+
+    /**
+     * 86. MiniAppApiRouter — autentifikatsiyasiz/yaroqsiz initData har doim
+     *     401 bilan rad etiladi; `me` amali foydalanuvchi admin bo'lgan
+     *     guruhlar ro'yxatini qaytaradi (2.0 Phase 3, 3-band).
+     */
+    public function testMiniAppApiRouterRejectsInvalidAuthAndListsAdminGroups(): void
+    {
+        $oldToken = (string)Config::get('TELEGRAM_BOT_TOKEN', '');
+        Config::set('TELEGRAM_BOT_TOKEN', 'test-bot-token-mini-app-86');
+        try {
+            $chatId = -100889099;
+            SettingsService::get($chatId);
+            (new AdminAuthorizationService())->isAdmin($chatId, 1);
+
+            $router = new MiniAppApiRouter();
+
+            $unauth = $router->handle('me', [], [], 'garbage-init-data');
+            $this->assertFalse($unauth['ok']);
+            $this->assertEquals(401, $unauth['http_status']);
+
+            $initData = $this->buildInitData(['id' => 1, 'first_name' => 'Admin'], 'test-bot-token-mini-app-86');
+            $me = $router->handle('me', [], [], $initData);
+            $this->assertTrue($me['ok']);
+            $chatIds = array_column($me['groups'], 'chat_id');
+            $this->assertTrue(in_array($chatId, $chatIds, true), "Admin bo'lgan guruh /me ro'yxatida bo'lishi kerak");
+        } finally {
+            Config::set('TELEGRAM_BOT_TOKEN', $oldToken);
+        }
+    }
+
+    /**
+     * 87. MiniAppApiRouter `overview`/`settings_get`/`settings_update` — faqat
+     *     o'sha guruh admini uchun ishlaydi (boshqa foydalanuvchi uchun 403),
+     *     sozlama yangilash haqiqatan bazaga yoziladi (2.0 Phase 3, 3-band).
+     */
+    public function testMiniAppApiRouterOverviewAndSettingsRoundTrip(): void
+    {
+        $oldToken = (string)Config::get('TELEGRAM_BOT_TOKEN', '');
+        Config::set('TELEGRAM_BOT_TOKEN', 'test-bot-token-mini-app-87');
+        try {
+            $chatId = -100889199;
+            SettingsService::get($chatId);
+            (new AdminAuthorizationService())->isAdmin($chatId, 1);
+            $router = new MiniAppApiRouter();
+            $adminInitData = $this->buildInitData(['id' => 1, 'first_name' => 'Admin'], 'test-bot-token-mini-app-87');
+
+            $overview = $router->handle('overview', ['chat_id' => (string)$chatId], [], $adminInitData);
+            $this->assertTrue($overview['ok']);
+            $this->assertEquals('free', $overview['plan']['plan']);
+            $this->assertEquals(0, $overview['moderation']['active_warnings']);
+
+            // Admin bo'lmagan foydalanuvchi — 403.
+            $strangerInitData = $this->buildInitData(['id' => 999888, 'first_name' => 'Stranger'], 'test-bot-token-mini-app-87');
+            $forbidden = $router->handle('overview', ['chat_id' => (string)$chatId], [], $strangerInitData);
+            $this->assertFalse($forbidden['ok']);
+            $this->assertEquals(403, $forbidden['http_status']);
+
+            $update = $router->handle('settings_update', [], ['chat_id' => $chatId, 'settings' => ['flood_enabled' => 0, 'warn_limit' => 5]], $adminInitData);
+            $this->assertTrue($update['ok']);
+            $this->assertEquals(0, (int)$update['settings']['flood_enabled']);
+            $this->assertEquals(5, (int)$update['settings']['warn_limit']);
+
+            $get = $router->handle('settings_get', ['chat_id' => (string)$chatId], [], $adminInitData);
+            $this->assertEquals(0, (int)$get['settings']['flood_enabled']);
+        } finally {
+            Config::set('TELEGRAM_BOT_TOKEN', $oldToken);
+        }
+    }
+
+    /**
+     * 88. MiniAppApiRouter `warnings` ro'yxati va `unmute`/`unban`/`resetwarns`
+     *     moderatsiya amallari haqiqiy `PunishmentService` orqali ishlaydi
+     *     (2.0 Phase 3, 3-band).
+     */
+    public function testMiniAppApiRouterWarningsListAndModerationActions(): void
+    {
+        $oldToken = (string)Config::get('TELEGRAM_BOT_TOKEN', '');
+        Config::set('TELEGRAM_BOT_TOKEN', 'test-bot-token-mini-app-88');
+        try {
+            $chatId = -100889299;
+            $targetUserId = 7299;
+            $telegram = new class extends TelegramClient {
+                public array $calls = [];
+                public function deleteMessage(int|string $chatId, int $messageId): bool { return true; }
+                public function muteUser(int|string $chatId, int $userId, int $durationSeconds = 3600): bool { return true; }
+                public function unmuteUser(int|string $chatId, int $userId): bool { $this->calls[] = 'unmute'; return true; }
+                public function unbanChatMember(int|string $chatId, int $userId, bool $onlyIfBanned = true): bool { $this->calls[] = 'unban'; return true; }
+                public function sendMessage(int|string $chatId, string $text, array $extra = []): array { return ['ok' => true, 'result' => ['message_id' => 1]]; }
+            };
+            $auth = new AdminAuthorizationService($telegram);
+            $punishment = new PunishmentService($telegram, $auth);
+            $auth->isAdmin($chatId, 1);
+
+            $punishment->execute($chatId, $targetUserId, 9299, [
+                'action' => 'mute_user', 'delete_message' => false, 'reason' => 'Sinov', 'strike_count' => 2,
+            ]);
+
+            $router = new MiniAppApiRouter($telegram, $auth, $punishment);
+            $adminInitData = $this->buildInitData(['id' => 1, 'first_name' => 'Admin'], 'test-bot-token-mini-app-88');
+
+            $warnings = $router->handle('warnings', ['chat_id' => (string)$chatId], [], $adminInitData);
+            $this->assertTrue($warnings['ok']);
+            $this->assertEquals(1, count($warnings['warnings']));
+            $this->assertEquals($targetUserId, (int)$warnings['warnings'][0]['user_id']);
+
+            $unmute = $router->handle('unmute', [], ['chat_id' => $chatId, 'user_id' => $targetUserId], $adminInitData);
+            $this->assertTrue($unmute['ok']);
+            $this->assertTrue($unmute['success']);
+
+            $resetwarns = $router->handle('resetwarns', [], ['chat_id' => $chatId, 'user_id' => $targetUserId], $adminInitData);
+            $this->assertTrue($resetwarns['ok']);
+
+            $warningsAfterReset = $router->handle('warnings', ['chat_id' => (string)$chatId], [], $adminInitData);
+            $this->assertEquals(0, count($warningsAfterReset['warnings']));
+            $this->assertTrue(in_array('unmute', $telegram->calls, true));
+        } finally {
+            Config::set('TELEGRAM_BOT_TOKEN', $oldToken);
+        }
+    }
+
+    /**
+     * 89. MiniAppApiRouter `appeals` ro'yxati va `review_appeal` — shikoyatni
+     *     qabul qilish cheklovni olib tashlaydi va holatni 'accepted' qiladi,
+     *     rad etish esa cheklovni saqlab qoladi va 'rejected' qiladi
+     *     (2.0 Phase 3, 3-band).
+     */
+    public function testMiniAppApiRouterAppealsListAndReview(): void
+    {
+        $oldToken = (string)Config::get('TELEGRAM_BOT_TOKEN', '');
+        Config::set('TELEGRAM_BOT_TOKEN', 'test-bot-token-mini-app-89');
+        try {
+            $chatId = -100889399;
+            $targetUserId = 7399;
+            $telegram = new class extends TelegramClient {
+                public array $sentTo = [];
+                public function deleteMessage(int|string $chatId, int $messageId): bool { return true; }
+                public function muteUser(int|string $chatId, int $userId, int $durationSeconds = 3600): bool { return true; }
+                public function unmuteUser(int|string $chatId, int $userId): bool { return true; }
+                public function answerCallbackQuery(string $callbackQueryId, string $text = '', bool $showAlert = false): bool { return true; }
+                public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+                {
+                    $this->sentTo[] = (int)$chatId;
+                    return ['ok' => true, 'result' => ['message_id' => 1]];
+                }
+            };
+            $auth = new AdminAuthorizationService($telegram);
+            $punishment = new PunishmentService($telegram, $auth);
+            $auth->isAdmin($chatId, 1);
+
+            $punishment->execute($chatId, $targetUserId, 9399, [
+                'action' => 'mute_user', 'delete_message' => false, 'reason' => 'Sinov shikoyati', 'strike_count' => 2,
+            ]);
+            $actionId = (int)Database::getConnection()->query("SELECT MAX(id) FROM telegram_actions")->fetchColumn();
+
+            // Nishonlangan foydalanuvchining o'zi shikoyat ochadi (botning mavjud yo'li orqali).
+            $updateRouter = new UpdateRouter($telegram, $auth, $punishment);
+            $updateRouter->handle([
+                'update_id' => 998399,
+                'callback_query' => ['id' => 'cbq-389', 'from' => ['id' => $targetUserId, 'first_name' => 'User'], 'data' => "appeal_request:{$actionId}"],
+            ]);
+
+            $router = new MiniAppApiRouter($telegram, $auth, $punishment);
+            $adminInitData = $this->buildInitData(['id' => 1, 'first_name' => 'Admin'], 'test-bot-token-mini-app-89');
+
+            $appeals = $router->handle('appeals', ['chat_id' => (string)$chatId], [], $adminInitData);
+            $this->assertTrue($appeals['ok']);
+            $this->assertEquals(1, count($appeals['appeals']));
+            $appealId = (int)$appeals['appeals'][0]['id'];
+
+            $review = $router->handle('review_appeal', [], ['appeal_id' => $appealId, 'accept' => true], $adminInitData);
+            $this->assertTrue($review['ok']);
+            $this->assertEquals('accepted', $review['status']);
+            $this->assertTrue(in_array($targetUserId, $telegram->sentTo, true), "Shikoyat egasiga natija haqida DM yuborilishi kerak");
+
+            $reReview = $router->handle('review_appeal', [], ['appeal_id' => $appealId, 'accept' => false], $adminInitData);
+            $this->assertFalse($reReview['ok']);
+            $this->assertEquals(409, $reReview['http_status']);
+        } finally {
+            Config::set('TELEGRAM_BOT_TOKEN', $oldToken);
+        }
+    }
+
+    /**
+     * 90. Botning bosh menyusidagi "📊 Dashboard" (`web_app`) tugmasi FAQAT
+     *     `MINIAPP_URL`/`TELEGRAM_WEBHOOK_URL`dan https:// manzil chiqarilganda
+     *     ko'rsatiladi; http:// yoki bo'sh bo'lsa — umuman ko'rsatilmaydi
+     *     (2.0 Phase 3, 3-band).
+     */
+    public function testDashboardButtonShownOnlyWithValidHttpsMiniAppUrl(): void
+    {
+        $oldMiniApp = (string)Config::get('MINIAPP_URL', '');
+        $oldWebhook = (string)Config::get('TELEGRAM_WEBHOOK_URL', '');
+        try {
+            $telegram = new class extends TelegramClient {
+                public array $sent = [];
+                public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+                {
+                    $this->sent[] = ['chat_id' => (int)$chatId, 'extra' => $extra];
+                    return ['ok' => true, 'result' => ['message_id' => 1]];
+                }
+            };
+            $router = new UpdateRouter($telegram);
+
+            Config::set('MINIAPP_URL', '');
+            Config::set('TELEGRAM_WEBHOOK_URL', 'https://bot.example.com/webhook.php');
+            $router->handle(['update_id' => 990001, 'message' => ['message_id' => 1, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => '/menu']]);
+            $lastSent = end($telegram->sent);
+            $json = json_encode($lastSent['extra'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $this->assertStringContainsString('https://bot.example.com/miniapp/', $json, "Webhook domenidan avtomatik https manzil hosil bo'lishi kerak");
+
+            $telegram->sent = [];
+            Config::set('TELEGRAM_WEBHOOK_URL', 'http://insecure.example.com/webhook.php');
+            $router->handle(['update_id' => 990002, 'message' => ['message_id' => 2, 'chat' => ['id' => 1, 'type' => 'private'], 'from' => ['id' => 1, 'is_bot' => false, 'first_name' => 'Admin'], 'text' => '/menu']]);
+            $lastSent2 = end($telegram->sent);
+            $json2 = json_encode($lastSent2['extra'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            $this->assertFalse(str_contains($json2, 'web_app'), "http:// manzil bilan Dashboard tugmasi ko'rsatilmasligi kerak");
+        } finally {
+            Config::set('MINIAPP_URL', $oldMiniApp);
+            Config::set('TELEGRAM_WEBHOOK_URL', $oldWebhook);
+        }
+    }
+
+    /**
+     * 91. Forum-mavzular (topics): agar yangi a'zo xabari `is_topic_message: true`
+     *     va `message_thread_id`ga ega bo'lsa, CAPTCHA salomlashuv xabari xuddi
+     *     o'sha mavzuga (`message_thread_id` bilan) yuborilishi kerak; oddiy guruh
+     *     yoki forumning "General" mavzusida (bu maydonlar yo'q) esa
+     *     `message_thread_id` umuman qo'shilmasligi kerak (2.0 Phase 4, 1-band).
+     */
+    public function testCaptchaWelcomeMessageUsesMessageThreadIdInsideForumTopic(): void
+    {
+        $chatId = -100888001;
+        $userId = 555001;
+        SettingsService::update($chatId, ['captcha_enabled' => 1, 'captcha_timeout_sec' => 45]);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'extra' => $extra];
+                return ['ok' => true, 'result' => ['message_id' => 1]];
+            }
+        };
+        $router = new UpdateRouter($telegram);
+
+        $router->handle([
+            'update_id' => 998001,
+            'message' => [
+                'message_id' => 6001,
+                'message_thread_id' => 777,
+                'is_topic_message' => true,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => 999, 'is_bot' => false],
+                'new_chat_members' => [
+                    ['id' => $userId, 'is_bot' => false, 'first_name' => 'Mavzu', 'last_name' => 'Azosi'],
+                ],
+            ],
+        ]);
+        $captchaSent = end($telegram->sent);
+        $this->assertNotNull($captchaSent, "CAPTCHA xabari yuborilishi kerak");
+        $this->assertEquals(777, $captchaSent['extra']['message_thread_id'] ?? null, "Forum mavzusidagi yangi a'zoga CAPTCHA o'sha mavzuga yuborilishi kerak");
+
+        // Endi forumning "General" mavzusida (is_topic_message/message_thread_id yo'q) —
+        // message_thread_id butunlay qo'shilmasligi kerak.
+        $chatId2 = -100888002;
+        $userId2 = 555002;
+        SettingsService::update($chatId2, ['captcha_enabled' => 1, 'captcha_timeout_sec' => 45]);
+        $telegram->sent = [];
+        $router->handle([
+            'update_id' => 998002,
+            'message' => [
+                'message_id' => 6002,
+                'chat' => ['id' => $chatId2, 'type' => 'supergroup'],
+                'from' => ['id' => 999, 'is_bot' => false],
+                'new_chat_members' => [
+                    ['id' => $userId2, 'is_bot' => false, 'first_name' => 'Oddiy', 'last_name' => 'Azo'],
+                ],
+            ],
+        ]);
+        $captchaSent2 = end($telegram->sent);
+        $this->assertNotNull($captchaSent2, "CAPTCHA xabari yuborilishi kerak");
+        $this->assertFalse(array_key_exists('message_thread_id', $captchaSent2['extra']), "Oddiy guruhda/General mavzusida message_thread_id qo'shilmasligi kerak");
+    }
+
+    /**
+     * 92. Forum-mavzular: /addmod kabi guruh-buyruqlarining javob xabarlari ham
+     *     buyruq qaysi mavzuda yuborilgan bo'lsa, o'sha mavzuga qaytarilishi kerak
+     *     (2.0 Phase 4, 1-band). Shu bilan birga admin bo'lmagan foydalanuvchiga
+     *     "faqat administratorlar uchun" rad javobi ham xuddi shu mavzuga boradi.
+     */
+    public function testGroupCommandRepliesRespectForumTopicThreadId(): void
+    {
+        $chatId = -100888003;
+        $adminId = 1; // Test rejimida TelegramClient stubi: id=1 -> 'creator'.
+        $nonAdminId = 555010;
+        $targetId = 555011;
+        SettingsService::get($chatId);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'extra' => $extra];
+                return ['ok' => true, 'result' => ['message_id' => 1]];
+            }
+        };
+        $router = new UpdateRouter($telegram);
+
+        // Admin /addmod buyrug'ini forum mavzusi ichida beradi.
+        $addResult = $router->handle([
+            'update_id' => 998010,
+            'message' => [
+                'message_id' => 6010,
+                'message_thread_id' => 321,
+                'is_topic_message' => true,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $adminId, 'is_bot' => false],
+                'text' => '/addmod',
+                'reply_to_message' => ['message_id' => 6009, 'from' => ['id' => $targetId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('command_executed', $addResult['status']);
+        $addSent = end($telegram->sent);
+        $this->assertEquals(321, $addSent['extra']['message_thread_id'] ?? null, "/addmod tasdiqlash xabari buyruq berilgan mavzuga yuborilishi kerak");
+
+        // Cheklangan "moderator" (to'liq admin emas) forum mavzusi ichida o'ziga
+        // yopiq bo'lgan /addmod (rol-boshqaruv) buyrug'ini beradi — rad javobi
+        // ham xuddi shu mavzuga borishi kerak.
+        AdminAuthorizationService::setModeratorRole($chatId, $nonAdminId, true);
+        $telegram->sent = [];
+        $rejectResult = $router->handle([
+            'update_id' => 998011,
+            'message' => [
+                'message_id' => 6011,
+                'message_thread_id' => 321,
+                'is_topic_message' => true,
+                'chat' => ['id' => $chatId, 'type' => 'supergroup'],
+                'from' => ['id' => $nonAdminId, 'is_bot' => false],
+                'text' => '/addmod',
+                'reply_to_message' => ['message_id' => 6009, 'from' => ['id' => $targetId, 'is_bot' => false]],
+            ],
+        ]);
+        $this->assertEquals('forbidden_for_moderator', $rejectResult['status']);
+        $rejectSent = end($telegram->sent);
+        $this->assertNotNull($rejectSent, "Moderatorga rad javobi yuborilishi kerak");
+        $this->assertEquals(321, $rejectSent['extra']['message_thread_id'] ?? null, "Admin-rad javobi ham buyruq berilgan mavzuga yuborilishi kerak");
+    }
+
+    /**
+     * 93. `/clonesettings manba maqsad` — chaqiruvchi IKKALA guruhning ham admini
+     *     bo'lsa, `SettingsService::CLONEABLE_COLUMNS` to'plami manba guruhdan
+     *     maqsad guruhga to'g'ridan-to'g'ri nusxalanadi; faqat bitta guruhning
+     *     (yoki hech birining) admini bo'lmasa — rad etiladi va hech narsa
+     *     o'zgarmaydi (2.0 Phase 4, 2-band).
+     */
+    public function testCloneSettingsCopiesCloneableFieldsBetweenGroupsWhenAuthorized(): void
+    {
+        $sourceChatId = -100889001;
+        $targetChatId = -100889002;
+        $adminId = 1; // Test rejimida TelegramClient stubi: id=1 -> har qanday guruhda 'creator'.
+
+        SettingsService::get($sourceChatId);
+        SettingsService::get($targetChatId);
+        SettingsService::update($sourceChatId, [
+            'warn_limit' => 7,
+            'flood_max_messages' => 15,
+            'ai_mode' => 'economical',
+            'language' => 'ru',
+            'captcha_enabled' => 1,
+            'porn_action' => 'mute',
+        ]);
+
+        $router = new UpdateRouter();
+        $res = $router->handle([
+            'update_id' => 999001,
+            'message' => [
+                'message_id' => 1,
+                'chat' => ['id' => $adminId, 'type' => 'private'],
+                'from' => ['id' => $adminId, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => "/clonesettings {$sourceChatId} {$targetChatId}",
+            ],
+        ]);
+        $this->assertEquals('command_executed', $res['status']);
+        $this->assertEquals('/clonesettings', $res['cmd']);
+
+        $targetSettings = SettingsService::get($targetChatId);
+        $this->assertEquals(7, (int)$targetSettings['warn_limit']);
+        $this->assertEquals(15, (int)$targetSettings['flood_max_messages']);
+        $this->assertEquals('economical', $targetSettings['ai_mode']);
+        $this->assertEquals('ru', $targetSettings['language']);
+        $this->assertEquals(1, (int)$targetSettings['captcha_enabled']);
+        $this->assertEquals('mute', $targetSettings['porn_action']);
+
+        // Endi admin bo'lmagan foydalanuvchi (na manba, na maqsad guruh admini) urinadi — rad etilishi kerak.
+        SettingsService::update($sourceChatId, ['warn_limit' => 9]);
+        $nonAdminId = 889099;
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        // Chat_members'da 'member' (admin emas) sifatida ro'yxatdan o'tkazamiz — shu bilan
+        // TelegramClient'ning tashqi API'ga (real HTTP so'rov) chiqib ketmasligini ta'minlaymiz.
+        $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$sourceChatId}, {$nonAdminId}, 'member', '{$now}')");
+        $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$targetChatId}, {$nonAdminId}, 'member', '{$now}')");
+
+        $rejectRes = $router->handle([
+            'update_id' => 999002,
+            'message' => [
+                'message_id' => 2,
+                'chat' => ['id' => $nonAdminId, 'type' => 'private'],
+                'from' => ['id' => $nonAdminId, 'is_bot' => false, 'first_name' => 'OddiyFoydalanuvchi'],
+                'text' => "/clonesettings {$sourceChatId} {$targetChatId}",
+            ],
+        ]);
+        $this->assertEquals('error', $rejectRes['status']);
+        $this->assertEquals('unauthorized', $rejectRes['reason']);
+
+        $targetSettingsAfterReject = SettingsService::get($targetChatId);
+        $this->assertEquals(7, (int)$targetSettingsAfterReject['warn_limit'], "Ruxsatsiz urinishdan keyin maqsad guruh sozlamalari o'zgarmasligi kerak");
+    }
+
+    /**
+     * 94. `/exportsettings` guruhning joriy sozlamalarini JSON qilib qaytaradi;
+     *     `/importsettings` shu JSON'ni (qo'shimcha noto'g'ri/ruxsat etilmagan
+     *     maydonlar bilan aralashtirilgan holda ham) boshqa guruhga xavfsiz
+     *     qo'llaydi — faqat tekshiruvdan o'tgan qiymatlar yoziladi, qolganlari
+     *     (masalan noto'g'ri `ai_mode`, yoki umuman ruxsat etilmagan
+     *     `premium_expires_at`) jim tashlab ketiladi (2.0 Phase 4, 2-band).
+     */
+    public function testExportSettingsProducesJsonAndImportSettingsValidatesFields(): void
+    {
+        $sourceChatId = -100889003;
+        $targetChatId = -100889004;
+        $adminId = 1;
+
+        SettingsService::get($sourceChatId);
+        SettingsService::get($targetChatId);
+        // resolvePrivateManagedChat() adminGroupsOf() orqali chat_members keshini o'qiydi —
+        // shu sababli isAdmin() bir marta chaqirilib, DB keshi to'ldirilishi kerak (xuddi
+        // testLanguageCommandShowsAndChangesGroupLanguage'dagi kabi).
+        (new AdminAuthorizationService())->isAdmin($sourceChatId, $adminId);
+        (new AdminAuthorizationService())->isAdmin($targetChatId, $adminId);
+        SettingsService::update($sourceChatId, [
+            'warn_limit' => 5,
+            'unscannable_action' => 'delete_notify',
+            'flood_window_sec' => 20,
+        ]);
+        $originalTargetPremium = SettingsService::get($targetChatId)['premium_expires_at'] ?? null;
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = ['chat_id' => (int)$chatId, 'text' => $text, 'extra' => $extra];
+                return ['ok' => true, 'result' => ['message_id' => 1]];
+            }
+        };
+        $router = new UpdateRouter($telegram);
+
+        $exportRes = $router->handle([
+            'update_id' => 999010,
+            'message' => [
+                'message_id' => 10,
+                'chat' => ['id' => $adminId, 'type' => 'private'],
+                'from' => ['id' => $adminId, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => "/exportsettings {$sourceChatId}",
+            ],
+        ]);
+        $this->assertEquals('command_executed', $exportRes['status']);
+        $exportedSent = end($telegram->sent);
+        $this->assertNotNull($exportedSent);
+        $this->assertTrue((bool)preg_match('/<pre>(.*?)<\/pre>/s', (string)$exportedSent['text'], $m), "Eksport javobida JSON <pre> blok bo'lishi kerak");
+        $decoded = json_decode(trim($m[1]), true);
+        $this->assertNotNull($decoded, "Eksport qilingan JSON to'g'ri parse bo'lishi kerak");
+        $this->assertEquals(5, (int)$decoded['warn_limit']);
+        $this->assertEquals('delete_notify', $decoded['unscannable_action']);
+        $this->assertFalse(array_key_exists('premium_expires_at', $decoded), "premium_expires_at eksportga chiqmasligi kerak");
+        $this->assertFalse(array_key_exists('log_chat_id', $decoded), "log_chat_id eksportga chiqmasligi kerak");
+
+        // Import uchun JSON'ni ataylab buzamiz: noto'g'ri enum va ruxsat etilmagan maydon qo'shamiz.
+        $decoded['ai_mode'] = 'notavalidmode';
+        $decoded['premium_expires_at'] = '2099-01-01 00:00:00';
+        $decoded['unknown_field_xyz'] = 'qiymat';
+        $tamperedJson = json_encode($decoded, JSON_UNESCAPED_UNICODE);
+
+        $telegram->sent = [];
+        $importRes = $router->handle([
+            'update_id' => 999011,
+            'message' => [
+                'message_id' => 11,
+                'chat' => ['id' => $adminId, 'type' => 'private'],
+                'from' => ['id' => $adminId, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => "/importsettings {$targetChatId} {$tamperedJson}",
+            ],
+        ]);
+        $this->assertEquals('command_executed', $importRes['status']);
+        $this->assertTrue(in_array('ai_mode', $importRes['skipped'], true), "Noto'g'ri enum qiymati o'tkazib yuborilishi kerak");
+        $this->assertTrue(in_array('premium_expires_at', $importRes['skipped'], true), "Ruxsat etilmagan maydon o'tkazib yuborilishi kerak");
+        $this->assertTrue(in_array('unknown_field_xyz', $importRes['skipped'], true), "Noma'lum maydon o'tkazib yuborilishi kerak");
+
+        $targetSettings = SettingsService::get($targetChatId);
+        $this->assertEquals(5, (int)$targetSettings['warn_limit'], "To'g'ri qiymatlar qo'llanishi kerak");
+        $this->assertEquals('delete_notify', $targetSettings['unscannable_action']);
+        $this->assertEquals('comprehensive', $targetSettings['ai_mode'] ?? 'comprehensive', "Noto'g'ri ai_mode qo'llanmasligi va standart qiymat saqlanishi kerak");
+        $this->assertEquals($originalTargetPremium, $targetSettings['premium_expires_at'], "premium_expires_at import orqali o'zgartirilmasligi kerak");
+    }
+
+    /**
+     * 95. `/broadcast matn` — chaqiruvchi boshqargan HAR BIR guruh uchun
+     *     alohida `App\Jobs\BroadcastMessageJob` navbatga qo'yiladi (matn
+     *     HTML-xavfsiz ekranlangan holda), va guruh soni javobda to'g'ri
+     *     ko'rsatiladi. Matn ko'rsatilmasa — hech narsa navbatga qo'yilmaydi,
+     *     foydalanish yo'riqnomasi + guruh soni ko'rsatiladi (2.0 Phase 4, 3-band).
+     */
+    public function testBroadcastCommandQueuesJobPerManagedGroupWithEscapedText(): void
+    {
+        // MUHIM: userId=1 butun test to'plami davomida ko'plab guruhlarda admin
+        // sifatida to'planib boradi (chat_members jadvali testlar orasida
+        // tozalanmaydi — boshqa testlarda ataylab shunday, chunki har biri
+        // o'zining chat_id'lari bilan ishlaydi). Shu sababli bu yerda ALOHIDA,
+        // faqat shu testga xos admin ID ishlatiladi va aynan 3 ta guruhga
+        // to'g'ridan-to'g'ri SQL orqali "administrator" sifatida bog'lanadi —
+        // xuddi testCloneSettingsCopiesCloneableFieldsBetweenGroupsWhenAuthorized'dagi
+        // "member" qatoriga o'xshab.
+        $adminId = 890098;
+        $chatIdA = -100890001;
+        $chatIdB = -100890002;
+        $chatIdC = -100890003;
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        foreach ([$chatIdA, $chatIdB, $chatIdC] as $cid) {
+            SettingsService::get($cid);
+            $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$cid}, {$adminId}, 'administrator', '{$now}')");
+        }
+
+        $router = new UpdateRouter();
+
+        // Avval matnsiz — hech narsa navbatga qo'yilmasligi kerak.
+        $emptyRes = $router->handle([
+            'update_id' => 999020,
+            'message' => [
+                'message_id' => 20,
+                'chat' => ['id' => $adminId, 'type' => 'private'],
+                'from' => ['id' => $adminId, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => '/broadcast',
+            ],
+        ]);
+        $this->assertEquals('error', $emptyRes['status']);
+        $this->assertEquals('empty_text', $emptyRes['reason']);
+        $this->assertNull(QueueService::reserve('default'), "Matnsiz /broadcast hech qanday job navbatga qo'ymasligi kerak");
+
+        $res = $router->handle([
+            'update_id' => 999021,
+            'message' => [
+                'message_id' => 21,
+                'chat' => ['id' => $adminId, 'type' => 'private'],
+                'from' => ['id' => $adminId, 'is_bot' => false, 'first_name' => 'Admin'],
+                'text' => "/broadcast Ertaga texnik ishlar bo'ladi <script>",
+            ],
+        ]);
+        $this->assertEquals('command_executed', $res['status']);
+        $this->assertEquals(3, $res['queued_groups']);
+
+        $foundChatIds = [];
+        for ($i = 0; $i < 3; $i++) {
+            $job = QueueService::reserve('default');
+            $this->assertNotNull($job, "Har bir boshqarilgan guruh uchun job navbatga qo'yilishi kerak");
+            $this->assertEquals('App\Jobs\BroadcastMessageJob', $job['handler'] ?? null);
+            $foundChatIds[] = (int)($job['data']['chat_id'] ?? 0);
+            $this->assertEquals($adminId, (int)($job['data']['admin_user_id'] ?? 0));
+            $this->assertStringContainsString("Ertaga texnik ishlar", (string)($job['data']['text'] ?? ''));
+            $this->assertStringContainsString('&lt;script&gt;', (string)($job['data']['text'] ?? ''), "Admin matnidagi HTML ekranlangan bo'lishi kerak (xom holda o'tmasligi)");
+        }
+        $expectedChatIds = [$chatIdA, $chatIdB, $chatIdC];
+        sort($foundChatIds);
+        sort($expectedChatIds);
+        $this->assertEquals($expectedChatIds, $foundChatIds);
+        $this->assertNull(QueueService::reserve('default'), "Aynan 3 ta job navbatga qo'yilgan bo'lishi kerak, ortiqcha emas");
     }
 }

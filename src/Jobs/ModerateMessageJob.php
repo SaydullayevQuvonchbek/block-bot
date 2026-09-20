@@ -105,10 +105,18 @@ class ModerateMessageJob
             $mediaInfo = $this->extractMediaInfo($message);
             if ($mediaInfo !== null) {
                 $visionModel = !empty($settings['ai_model_vision']) ? (string)$settings['ai_model_vision'] : null;
+                // WEBM video-stikerlar oddiy videolar bilan bir xil (FFmpeg kadr-ajratish
+                // orqali) tekshiriladi, shu sababli FFmpeg mavjud bo'lmaganda ular ham
+                // video-muqova zaxira yo'liga tushishi kerak.
                 $isVideoLike = in_array($mediaInfo['type'], ['video', 'animation'], true)
-                    || ($mediaInfo['type'] === 'document' && str_starts_with((string)($mediaInfo['mime_type'] ?? ''), 'video/'));
+                    || ($mediaInfo['type'] === 'document' && str_starts_with((string)($mediaInfo['mime_type'] ?? ''), 'video/'))
+                    || ($mediaInfo['type'] === 'sticker' && !empty($mediaInfo['is_video']));
+                // TGS (Lottie) animatsion stikerlar hech qachon FFmpeg orqali dekodlanmaydi —
+                // faqat Telegram taqdim etadigan statik muqova (thumbnail) tekshiriladi.
+                $isLottieSticker = $mediaInfo['type'] === 'sticker'
+                    && !empty($mediaInfo['is_animated']) && empty($mediaInfo['is_video']);
 
-                if ($isVideoLike && !$mediaModerator->isFfmpegAvailable()) {
+                if ($isLottieSticker || ($isVideoLike && !$mediaModerator->isFfmpegAvailable())) {
                     if (!empty($mediaInfo['thumbnail_file_id'])) {
                         $finding = $mediaModerator->inspectVideoPreview(
                             (string)$mediaInfo['thumbnail_file_id'],
@@ -117,11 +125,17 @@ class ModerateMessageJob
                             "med_preview_{$messageId}",
                             $visionModel
                         );
+                        if ($isLottieSticker) {
+                            $finding['reason'] = (string)($finding['reason'] ?? '')
+                                . " (TGS/Lottie animatsion stiker: faqat statik muqova tekshirildi)";
+                        }
                     } else {
                         $finding = [
                             'status' => 'unscannable',
-                            'category' => 'ffmpeg_missing',
-                            'reason' => "FFmpeg va Telegram video muqovasi mavjud emas",
+                            'category' => $isLottieSticker ? 'lottie_sticker_no_preview' : 'ffmpeg_missing',
+                            'reason' => $isLottieSticker
+                                ? "TGS (Lottie) animatsion stikerni tahlil qilib bo'lmadi — muqova (preview) mavjud emas"
+                                : "FFmpeg va Telegram video muqovasi mavjud emas",
                             'evidence' => '',
                             'source' => 'media_moderator',
                             'frames_scanned' => 0,
@@ -223,8 +237,29 @@ class ModerateMessageJob
                 'mime_type' => $message['animation']['mime_type'] ?? 'video/mp4',
             ];
         }
+        if (!empty($message['voice'])) {
+            return [
+                'file_id' => $message['voice']['file_id'],
+                'type' => 'voice',
+                'mime_type' => $message['voice']['mime_type'] ?? 'audio/ogg',
+            ];
+        }
+        if (!empty($message['audio'])) {
+            return [
+                'file_id' => $message['audio']['file_id'],
+                'type' => 'audio',
+                'mime_type' => $message['audio']['mime_type'] ?? 'audio/mpeg',
+            ];
+        }
         if (!empty($message['sticker'])) {
-            return ['file_id' => $message['sticker']['file_id'], 'type' => 'sticker'];
+            return [
+                'file_id' => $message['sticker']['file_id'],
+                'type' => 'sticker',
+                'thumbnail_file_id' => $message['sticker']['thumbnail']['file_id'] ?? $message['sticker']['thumb']['file_id'] ?? null,
+                // Telegram: is_video=true -> WEBM video-stiker; is_animated=true (is_video=false) -> TGS (Lottie).
+                'is_video' => (bool)($message['sticker']['is_video'] ?? false),
+                'is_animated' => (bool)($message['sticker']['is_animated'] ?? false),
+            ];
         }
         if (!empty($message['document'])) {
             return [
