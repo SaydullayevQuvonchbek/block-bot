@@ -603,12 +603,22 @@ class UpdateRouter
         $optionsList = "<code>uz</code> — o'zbekcha\n<code>ru</code> — русский\n<code>en</code> — English";
 
         if ($arg === '') {
+            // 2.0 Phase 5 (UX): til kodini qo'lda yozish o'rniga tugmalar.
+            $labels = ['uz' => "🇺🇿 O'zbekcha", 'ru' => '🇷🇺 Русский', 'en' => '🇬🇧 English'];
+            $row = [];
+            foreach (Translator::SUPPORTED as $code) {
+                $mark = $code === $current ? '✅ ' : '';
+                $row[] = [
+                    'text' => $mark . ($labels[$code] ?? strtoupper($code)),
+                    'callback_data' => "setlang:{$chatId}:{$code}",
+                ];
+            }
             $this->telegram->sendMessage($replyChatId,
                 "🌐 Joriy til: <code>{$current}</code>\n\n"
                 . "Guruh a'zolariga ko'rinadigan xabarlar (yangi a'zo CAPTCHA'si, ogohlantirish/mute/ban) shu tilda yuboriladi. "
                 . "Admin panel va buyruqlarning o'zi hozircha o'zbek tilida qoladi.\n\n"
-                . "O'zgartirish uchun: <code>/til uz</code>, <code>/til ru</code> yoki <code>/til en</code>\n\n"
-                . "Mavjud tillar:\n{$optionsList}");
+                . "O'zgartirish uchun quyidagi tugmani bosing:",
+                ['reply_markup' => ['inline_keyboard' => [$row]]]);
             return ['status' => 'command_executed', 'cmd' => '/til'];
         }
 
@@ -639,8 +649,10 @@ class UpdateRouter
         $this->telegram->sendMessage($replyChatId,
             "📤 <b>Sozlamalar eksporti</b> — {$title} (<code>{$chatId}</code>)\n\n"
             . "<pre>{$json}</pre>\n\n"
-            . "Boshqa guruhga qo'llash uchun: <code>/importsettings maqsad_guruh_id &lt;yuqoridagi JSON&gt;</code>\n"
-            . "Yoki ikkala guruhni ham o'zingiz boshqarsangiz: <code>/clonesettings {$chatId} maqsad_guruh_id</code>",
+            . "Boshqa guruhga qo'llash uchun: yuqoridagi JSONni <code>/importsettings</code> bilan yuboring "
+            . "(guruh tugma orqali tanlanadi).\n"
+            . "Yoki ikkala guruhni ham o'zingiz boshqarsangiz — <code>/clonesettings</code> ancha qulay: "
+            . "JSON umuman kerak emas, guruhlar tugmalar orqali tanlanadi.",
             ['disable_web_page_preview' => true]);
         return ['status' => 'command_executed', 'cmd' => '/exportsettings', 'chat_id' => $chatId, 'exported' => $exported];
     }
@@ -1005,6 +1017,62 @@ class UpdateRouter
         return implode("\n", $lines);
     }
 
+    /**
+     * Guruh tanlash uchun inline tugmalar klaviaturasi (2.0 Phase 5 — UX
+     * soddalashtirish). Avval foydalanuvchi uzun guruh ID'sini (`-100...`)
+     * qo'lda yozishi kerak edi — bu juda noqulay edi. Endi har bir guruh
+     * alohida tugma sifatida ko'rsatiladi va bir bosishda tanlanadi.
+     *
+     * `$callbackPrefix` — `admin_premium` kabi prefiks; natijada callback
+     * `admin_premium:-100123...` ko'rinishida bo'ladi, ya'ni mavjud
+     * `handleCallbackQuery` dispatcheri (admin tekshiruvi bilan birga) uni
+     * o'zi qabul qiladi, qo'shimcha marshrutlash shart emas.
+     */
+    private function groupPickerKeyboard(array $groups, string $callbackPrefix): array
+    {
+        $rows = [];
+        foreach ($groups as $g) {
+            $gId = (int)$g['chat_id'];
+            $title = $this->resolveGroupTitle($gId, (string)($g['title'] ?? ''));
+            $rows[] = [[
+                'text' => "👥 {$title}",
+                'callback_data' => "{$callbackPrefix}:{$gId}",
+            ]];
+        }
+        return ['inline_keyboard' => $rows];
+    }
+
+    /**
+     * "Qaysi guruh uchun?" tugmalarini yuborish. Argumentsiz buyruqlar
+     * (`/premium`, `/wordlist`, `/modlist`, `/til`, `/exportsettings`) uchun
+     * ishlatiladi — tugma bosilishi bilan amal darhol bajariladi.
+     */
+    private function sendGroupPicker(int $userId, array $groups, string $callbackPrefix, string $title): array
+    {
+        $this->telegram->sendMessage($userId, $title, [
+            'reply_markup' => $this->groupPickerKeyboard($groups, $callbackPrefix),
+        ]);
+        return ['status' => 'private_group_selection_required', 'picker' => $callbackPrefix];
+    }
+
+    /**
+     * Argument talab qiladigan buyruqlar (`/blockword so'z`,
+     * `/importsettings {JSON}`) uchun guruh tanlash. Tugmali xabar
+     * foydalanuvchining ASL buyrug'iga javob (reply) sifatida yuboriladi —
+     * shunda tugma bosilganda `callback_query.message.reply_to_message.text`
+     * orqali asl matn (argument bilan birga) qayta o'qiladi va hech qanday
+     * qo'shimcha jadval/holat saqlash kerak bo'lmaydi.
+     */
+    private function sendArgGroupPicker(int $userId, array $groups, string $cmdKey, string $title, ?int $replyToMessageId): array
+    {
+        $extra = ['reply_markup' => $this->groupPickerKeyboard($groups, "argpick_{$cmdKey}")];
+        if ($replyToMessageId !== null) {
+            $extra['reply_to_message_id'] = $replyToMessageId;
+        }
+        $this->telegram->sendMessage($userId, $title, $extra);
+        return ['status' => 'private_group_selection_required', 'picker' => "argpick_{$cmdKey}"];
+    }
+
     private function handleModerationCommand(string $cmd, array $message, array $parts, int $chatId): array
     {
         $targetUserId = $this->resolveTargetUserId($message, $parts);
@@ -1148,6 +1216,59 @@ class UpdateRouter
             $this->telegram->answerCallbackQuery($cbId, "Bajarilmoqda...");
             $targetChatId = (int)($cb['message']['chat']['id'] ?? $userId);
             return $this->handlePrivateAdminAction(substr($action, 6), $chatId, $userId, $targetChatId);
+        }
+
+        // 2.0 Phase 5 (UX): til tugmasi — `/til uz` deb yozish o'rniga bir bosish.
+        if ($action === 'setlang') {
+            $lang = strtolower((string)($parts[2] ?? ''));
+            if (!in_array($lang, Translator::SUPPORTED, true)) {
+                $this->telegram->answerCallbackQuery($cbId, "Noma'lum til kodi.", true);
+                return ['status' => 'invalid_language'];
+            }
+            SettingsService::update($chatId, ['language' => $lang]);
+            $this->telegram->answerCallbackQuery($cbId, "Til: {$lang}");
+            $messageChatId = (int)($cb['message']['chat']['id'] ?? $chatId);
+            $this->telegram->sendMessage($messageChatId,
+                "✅ Til <code>{$lang}</code>ga o'zgartirildi. Guruh a'zolariga yuboriladigan yangi xabarlar "
+                . "(CAPTCHA, ogohlantirish/mute/ban) shu tilda bo'ladi.");
+            return ['status' => 'setting_updated', 'language' => $lang, 'chat_id' => $chatId];
+        }
+
+        // 2.0 Phase 5 (UX): argumentli buyruqlar uchun guruh tanlash tugmasi.
+        // Asl buyruq matni (so'z yoki JSON) tugmali xabarning `reply_to_message`
+        // maydonidan qayta o'qiladi — hech narsa saqlab qo'yilmaydi.
+        if (str_starts_with($action, 'argpick_')) {
+            $kind = substr($action, 8);
+            $original = trim((string)($cb['message']['reply_to_message']['text'] ?? ''));
+            if ($original === '') {
+                $this->telegram->answerCallbackQuery($cbId, "Asl buyruq topilmadi, qaytadan yuboring.", true);
+                return ['status' => 'argpick_original_missing', 'kind' => $kind];
+            }
+
+            $messageChatId = (int)($cb['message']['chat']['id'] ?? $userId);
+            if ($kind === 'word' && preg_match('/^(\/(?:blockword|allowword|unblockword))(?:@\w+)?\s+(.*)$/is', $original, $m)) {
+                $this->telegram->answerCallbackQuery($cbId, "Bajarilmoqda...");
+                $wordCmd = strtolower($m[1]);
+                // Asl buyruqda guruh ID bo'lishi mumkin emas (aks holda picker
+                // umuman chiqmagan bo'lardi), shuning uchun qolgani — sof ibora.
+                $phrase = trim($m[2]);
+                return $this->handleWordRuleCommand($wordCmd, "{$wordCmd} {$phrase}", [$wordCmd], $chatId, $messageChatId);
+            }
+            if ($kind === 'import' && preg_match('/^\/importsettings(?:@\w+)?\s+([\s\S]*)$/i', $original, $m)) {
+                $this->telegram->answerCallbackQuery($cbId, "Bajarilmoqda...");
+                return $this->handleImportSettingsCommand($chatId, trim($m[1]), $messageChatId);
+            }
+
+            $this->telegram->answerCallbackQuery($cbId, "Buyruqni o'qib bo'lmadi, qaytadan yuboring.", true);
+            return ['status' => 'argpick_unparsed', 'kind' => $kind];
+        }
+
+        // 2.0 Phase 5 (UX): sozlamalarni klonlash, 2-bosqich — maqsad guruh tanlandi.
+        if ($action === 'cloneto') {
+            $targetGroupId = (int)($parts[2] ?? 0);
+            $messageChatId = (int)($cb['message']['chat']['id'] ?? $userId);
+            $this->telegram->answerCallbackQuery($cbId, "Nusxalanmoqda...");
+            return $this->handleCloneSettingsCommand($userId, $chatId, $targetGroupId, $messageChatId);
         }
 
         // Rollback amallari
@@ -1618,6 +1739,48 @@ class UpdateRouter
             return ['status' => $ok ? 'audit_state_changed' : 'error', 'action' => $action];
         }
 
+        // 2.0 Phase 5 (UX soddalashtirish): Phase 3-4'da qo'shilgan funksiyalar
+        // avval faqat matnli buyruq + qo'lda yozilgan guruh ID orqali ishlatilardi.
+        // Endi ular ham tugmalar orqali — sozlamalar panelidan yoki guruh
+        // tanlash ro'yxatidan bir bosishda ochiladi.
+        if ($action === 'premium') {
+            return $this->handlePremiumStatusCommand($chatId, $targetChatId);
+        }
+
+        if ($action === 'wordlist') {
+            return $this->handleWordListCommand($chatId, $targetChatId);
+        }
+
+        if ($action === 'modlist') {
+            return $this->handleModListCommand($chatId, $targetChatId);
+        }
+
+        if ($action === 'lang') {
+            return $this->handleLanguageCommand($chatId, '', $targetChatId);
+        }
+
+        if ($action === 'export') {
+            return $this->handleExportSettingsCommand($chatId, $targetChatId);
+        }
+
+        // Sozlamalarni klonlash, 1-bosqich: manba guruh allaqachon tanlangan,
+        // endi MAQSAD guruhni tanlash tugmalari ko'rsatiladi.
+        if ($action === 'clonefrom') {
+            $groups = $this->adminGroupsOf($adminId);
+            $targets = array_values(array_filter($groups, fn($g) => (int)$g['chat_id'] !== $chatId));
+            if ($targets === []) {
+                $this->telegram->sendMessage($targetChatId,
+                    "❌ Nusxalash uchun boshqa guruh topilmadi — siz hozircha faqat bitta guruhni boshqarasiz.");
+                return ['status' => 'clone_no_targets'];
+            }
+            $sourceTitle = htmlspecialchars($this->resolveGroupTitle($chatId, ''), ENT_QUOTES, 'UTF-8');
+            $this->telegram->sendMessage($targetChatId,
+                "📋 <b>{$sourceTitle}</b> sozlamalari qaysi guruhga nusxalansin?\n\n"
+                . "⚠️ Tanlangan guruhning joriy sozlamalari almashtiriladi.",
+                ['reply_markup' => $this->groupPickerKeyboard($targets, "cloneto:{$chatId}")]);
+            return ['status' => 'clone_target_picker_sent', 'source_chat_id' => $chatId];
+        }
+
         if ($action === 'status') {
             $statusMsg = "⚙️ <b>Bot Tizim Holati</b>\n"
                 . "• Webhook: Faol ✅\n"
@@ -1733,6 +1896,20 @@ class UpdateRouter
                     ['text' => '📈 Statistika', 'callback_data' => "admin_stats:{$chatId}"],
                     ['text' => '💰 AI sarfi', 'callback_data' => "admin_ai_usage:{$chatId}"],
                 ],
+                // 2.0 Phase 5 (UX): Phase 3-4 funksiyalari endi shu panelda —
+                // guruh ID'sini qo'lda yozish umuman kerak emas.
+                [
+                    ['text' => '🌐 Til: ' . strtoupper(Translator::normalizeLang($s['language'] ?? null)), 'callback_data' => "admin_lang:{$chatId}"],
+                    ['text' => (SubscriptionService::getPlan($chatId)['is_premium'] ? '⭐ Premium' : '🆓 Tarif'), 'callback_data' => "admin_premium:{$chatId}"],
+                ],
+                [
+                    ['text' => "📝 So'zlar ro'yxati", 'callback_data' => "admin_wordlist:{$chatId}"],
+                    ['text' => '🛡 Moderatorlar', 'callback_data' => "admin_modlist:{$chatId}"],
+                ],
+                [
+                    ['text' => '📤 Sozlamalarni eksport', 'callback_data' => "admin_export:{$chatId}"],
+                    ['text' => '📋 Boshqa guruhga nusxalash', 'callback_data' => "admin_clonefrom:{$chatId}"],
+                ],
             ]
         ];
 
@@ -1842,17 +2019,18 @@ class UpdateRouter
             . "/scan_members — a'zolarni 18+ / bot akkauntlarga tekshirish\n"
             . "/audit [mtproto|json] — eski xabarlar tarixini tahlil qilish\n"
             . "/audit_status /audit_pause /audit_resume /audit_cancel /audit_report — audit boshqaruvi\n"
-            . "/blockword, /allowword, /unblockword guruh_id so'z — jargon/lahjadagi maxsus so'zlarni boshqarish\n"
-            . "/wordlist [guruh_id] — maxsus so'z qoidalari ro'yxati\n"
-            . "/modlist [guruh_id] — botning ichki moderatorlari ro'yxati\n"
-            . "/til [guruh_id] [uz|ru|en] — guruh a'zolariga ko'rinadigan xabarlar "
+            . "/blockword, /allowword, /unblockword so'z — jargon/lahjadagi maxsus so'zlarni boshqarish\n"
+            . "/wordlist — maxsus so'z qoidalari ro'yxati\n"
+            . "/modlist — botning ichki moderatorlari ro'yxati\n"
+            . "/til — guruh a'zolariga ko'rinadigan xabarlar "
             . "(CAPTCHA, ogohlantirish/mute/ban) tilini ko'rish/o'zgartirish\n"
-            . "/exportsettings [guruh_id] — guruh sozlamalarini JSON ko'rinishida olish\n"
-            . "/importsettings guruh_id {JSON} — eksport qilingan JSON'ni guruhga qo'llash\n"
-            . "/clonesettings manba_id maqsad_id — bir guruh sozlamalarini boshqasiga to'g'ridan-to'g'ri nusxalash "
-            . "(ikkalasining ham admini bo'lishingiz shart)\n"
+            . "/premium — guruh tarifi (Bepul/Premium) va Telegram Stars orqali obuna\n"
+            . "/exportsettings — guruh sozlamalarini JSON ko'rinishida olish\n"
+            . "/importsettings {JSON} — eksport qilingan JSON'ni guruhga qo'llash\n"
+            . "/clonesettings — bir guruh sozlamalarini boshqasiga nusxalash (tugmalar orqali tanlanadi)\n"
             . "/broadcast matn — boshqargan barcha guruhlaringizga botning o'zi orqali bitta e'lon/ogohlantirish yuborish\n"
-            . "<i>(Bir nechta guruhni boshqarsangiz, guruh ID'ni buyruqdan oldin ko'rsating — /mygroups orqali ko'rish mumkin)</i>\n"
+            . "<i>(Bir nechta guruhni boshqarsangiz, bot o'zi guruh tanlash tugmalarini chiqaradi — "
+            . "uzun guruh ID'sini yozish shart emas. Hammasi bir joyda: /mygroups → guruh → sozlamalar paneli.)</i>\n"
             . "/appeal ID — cheklovga shikoyat\n\n"
             . "<b>Eski xabarlar auditi qanday ishlaydi?</b>\n"
             . "Telegram Bot API bot qo'shilishidan oldingi xabarlarni o'qiy olmaydi. Shuning uchun: "
@@ -2006,12 +2184,16 @@ class UpdateRouter
                 $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
                 return ['status' => 'unauthorized'];
             }
-            if ($resolved['error'] === 'ambiguous' || $resolved['rest'] === '') {
+            if ($resolved['rest'] === '') {
                 $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz (yoki so'z ko'rsatilmadi). Foydalanish:\n"
-                    . "<code>{$cmd} -100... so'z_yoki_ibora</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                    "So'z yoki ibora ko'rsatilmadi. Masalan:\n<code>{$cmd} reklama</code>");
                 return ['status' => 'private_group_selection_required'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                $word = htmlspecialchars($resolved['rest'], ENT_QUOTES, 'UTF-8');
+                return $this->sendArgGroupPicker($userId, $resolved['groups'], 'word',
+                    "<b>{$word}</b> — qaysi guruh uchun? Tugmani bosing:",
+                    (int)($message['message_id'] ?? 0) ?: null);
             }
 
             $fakeParts = [$cmd, $resolved['rest']];
@@ -2031,10 +2213,8 @@ class UpdateRouter
                 return ['status' => 'unauthorized'];
             }
             if ($resolved['error'] === 'ambiguous') {
-                $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/wordlist -100...</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
-                return ['status' => 'private_group_selection_required'];
+                return $this->sendGroupPicker($userId, $resolved['groups'], 'admin_wordlist',
+                    "📝 Qaysi guruhning so'zlar ro'yxati? Tugmani bosing:");
             }
 
             return $this->handleWordListCommand($resolved['chat_id'], $userId);
@@ -2053,10 +2233,8 @@ class UpdateRouter
                 return ['status' => 'unauthorized'];
             }
             if ($resolved['error'] === 'ambiguous') {
-                $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/modlist -100...</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
-                return ['status' => 'private_group_selection_required'];
+                return $this->sendGroupPicker($userId, $resolved['groups'], 'admin_modlist',
+                    "🛡 Qaysi guruhning moderatorlari? Tugmani bosing:");
             }
 
             return $this->handleModListCommand($resolved['chat_id'], $userId);
@@ -2076,10 +2254,8 @@ class UpdateRouter
                 return ['status' => 'unauthorized'];
             }
             if ($resolved['error'] === 'ambiguous') {
-                $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/til -100... uz|ru|en</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
-                return ['status' => 'private_group_selection_required'];
+                return $this->sendGroupPicker($userId, $resolved['groups'], 'admin_lang',
+                    "🌐 Qaysi guruhning tili? Tugmani bosing:");
             }
 
             return $this->handleLanguageCommand($resolved['chat_id'], $resolved['rest'], $userId);
@@ -2099,10 +2275,8 @@ class UpdateRouter
                 return ['status' => 'unauthorized'];
             }
             if ($resolved['error'] === 'ambiguous') {
-                $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/premium -100...</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
-                return ['status' => 'private_group_selection_required'];
+                return $this->sendGroupPicker($userId, $resolved['groups'], 'admin_premium',
+                    "⭐ Qaysi guruhning tarifi? Tugmani bosing:");
             }
 
             return $this->handlePremiumStatusCommand($resolved['chat_id'], $userId);
@@ -2122,10 +2296,8 @@ class UpdateRouter
                 return ['status' => 'unauthorized'];
             }
             if ($resolved['error'] === 'ambiguous') {
-                $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz. Foydalanish: <code>/exportsettings -100...</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
-                return ['status' => 'private_group_selection_required'];
+                return $this->sendGroupPicker($userId, $resolved['groups'], 'admin_export',
+                    "📤 Qaysi guruh sozlamalarini eksport qilamiz? Tugmani bosing:");
             }
 
             return $this->handleExportSettingsCommand($resolved['chat_id'], $userId);
@@ -2144,12 +2316,18 @@ class UpdateRouter
                 $this->telegram->sendMessage($userId, "❌ Bu guruh administratori emassiz yoki guruh ID noto'g'ri.");
                 return ['status' => 'unauthorized'];
             }
-            if ($resolved['error'] === 'ambiguous' || $resolved['rest'] === '') {
+            if ($resolved['rest'] === '') {
                 $this->telegram->sendMessage($userId,
-                    "Siz bir nechta guruhni boshqarasiz (yoki JSON ko'rsatilmadi). Foydalanish:\n"
-                    . "<code>/importsettings -100... {...JSON...}</code>\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($resolved['groups']));
+                    "JSON ko'rsatilmadi. Avval <code>/exportsettings</code> bilan sozlamalarni oling, "
+                    . "so'ng shu JSONni <code>/importsettings</code> bilan yuboring.\n\n"
+                    . "Eslatma: ikkala guruhni ham o'zingiz boshqarsangiz, "
+                    . "<code>/clonesettings</code> ancha qulayroq — JSON bilan ishlash shart emas.");
                 return ['status' => 'private_group_selection_required'];
+            }
+            if ($resolved['error'] === 'ambiguous') {
+                return $this->sendArgGroupPicker($userId, $resolved['groups'], 'import',
+                    "📥 Bu sozlamalar qaysi guruhga qo'llanilsin? Tugmani bosing:",
+                    (int)($message['message_id'] ?? 0) ?: null);
             }
 
             return $this->handleImportSettingsCommand($resolved['chat_id'], $resolved['rest'], $userId);
@@ -2161,12 +2339,20 @@ class UpdateRouter
         if (preg_match('/^\/clonesettings(?:@\w+)?(?:\s+(.*))?$/is', $text, $match)) {
             $arg = trim((string)($match[1] ?? ''));
             if (!preg_match('/^(-?\d{6,})\s+(-?\d{6,})$/', $arg, $ids)) {
+                // 2.0 Phase 5 (UX): ikkita uzun ID yozish o'rniga ikki bosqichli
+                // tugmali tanlov — avval manba, so'ng maqsad guruh.
                 $groups = $this->adminGroupsOf($userId);
-                $this->telegram->sendMessage($userId,
-                    "Foydalanish: <code>/clonesettings manba_guruh_id maqsad_guruh_id</code>\n\n"
-                    . "Ikkalasining ham administratori bo'lishingiz shart.\n\n"
-                    . "Guruhlaringiz:\n" . $this->managedGroupsHintText($groups));
-                return ['status' => 'error', 'reason' => 'invalid_arguments'];
+                if ($groups === []) {
+                    $this->telegram->sendMessage($userId, "❌ Siz boshqaradigan faol guruh topilmadi.");
+                    return ['status' => 'managed_group_not_found'];
+                }
+                if (count($groups) < 2) {
+                    $this->telegram->sendMessage($userId,
+                        "❌ Nusxalash uchun kamida ikkita guruhni boshqarishingiz kerak.");
+                    return ['status' => 'clone_no_targets'];
+                }
+                return $this->sendGroupPicker($userId, $groups, 'admin_clonefrom',
+                    "📋 Sozlamalar <b>qaysi guruhdan</b> nusxalansin? (manba guruhni tanlang)");
             }
             return $this->handleCloneSettingsCommand($userId, (int)$ids[1], (int)$ids[2], $userId);
         }

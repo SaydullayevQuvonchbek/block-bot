@@ -398,9 +398,48 @@ premium sotib olish ishlamaydi).
 
 ---
 
+## 🖱 Hammasi tugmalar orqali — guruh ID yozish shart emas
+
+Bot bilan ishlashning **asosiy yo'li — shaxsiy chatdagi tugmalar**, matnli
+buyruqlar emas:
+
+```
+/mygroups  →  [👥 Guruh nomi]  →  ⚙️ sozlamalar paneli
+```
+
+Panelda bitta joyda: filtrlar (so'kinish, porno, media, havola, bot akkaunt),
+anti-flood, CAPTCHA, AI rejimi, **til**, **tarif (Premium)**, **so'zlar
+ro'yxati**, **moderatorlar**, **sozlamalar eksporti** va **boshqa guruhga
+nusxalash**, statistika, AI sarfi, audit — barchasi bir bosishda.
+
+Agar buyruqni to'g'ridan-to'g'ri yozsangiz va bir nechta guruhni boshqarsangiz,
+bot uzun ID so'ramaydi — **guruh tanlash tugmalarini** chiqaradi:
+
+```
+Siz:  /premium
+Bot:  ⭐ Qaysi guruhning tarifi? Tugmani bosing:
+      [👥 Marhabo kv]  [👥 BLOCKER BOT]  [👥 Shaxsiy narsalr]
+```
+
+Argumentli buyruqlarda ham xuddi shunday — argument yo'qolmaydi:
+
+```
+Siz:  /blockword reklama
+Bot:  reklama — qaysi guruh uchun? Tugmani bosing:
+      [👥 Marhabo kv]  [👥 BLOCKER BOT]
+```
+
+Sozlamalarni nusxalash ikki bosishda bajariladi: `/clonesettings` → manba
+guruh tugmasi → maqsad guruh tugmasi (JSON bilan ishlash shart emas).
+
+> Eski `/buyruq -100123456789 argument` sintaksisi ham ishlaydi — skript yoki
+> odat bo'yicha ID bilan yozadiganlar uchun hech narsa o'zgarmadi.
+
 ## 📋 Admin Buyruqlari
 
-Barcha buyruqlar faqat haqiqiy guruh adminlari yoki egasi tomonidan bajarilishi mumkin:
+Barcha buyruqlar faqat haqiqiy guruh adminlari yoki egasi tomonidan bajarilishi mumkin.
+Quyidagi jadvaldagi guruh ID'lari **ixtiyoriy** — ko'rsatilmasa bot guruh tanlash
+tugmalarini chiqaradi (yuqoriga qarang):
 
 | Buyruq | Tavsif |
 |---|---|
@@ -419,11 +458,11 @@ Barcha buyruqlar faqat haqiqiy guruh adminlari yoki egasi tomonidan bajarilishi 
 | `/allowword so'z` | Begunoh so'zni istisno (oq ro'yxat) qilish |
 | `/unblockword so'z` | Maxsus qoidani o'chirish |
 | `/wordlist` | Guruhning maxsus so'z qoidalari ro'yxati |
-| `/til [uz\|ru\|en]` | Guruh a'zolariga ko'rinadigan xabarlar (CAPTCHA, ogohlantirish/mute/ban) tilini ko'rish/o'zgartirish |
-| `/premium [guruh_id]` | Tarif holatini (bepul/premium) ko'rish va Telegram Stars orqali sotib olish |
-| `/exportsettings [guruh_id]` | Joriy sozlamalarni JSON ko'rinishida olish (zaxira yoki boshqa guruhga ko'chirish uchun) |
-| `/importsettings guruh_id {JSON}` | Eksport qilingan (yoki qo'lda tuzilgan) JSON'ni guruhga qo'llash |
-| `/clonesettings manba_id maqsad_id` | Bir guruh sozlamalarini boshqasiga to'g'ridan-to'g'ri nusxalash (ikkalasining ham admini bo'lish shart) |
+| `/til` | Guruh a'zolariga ko'rinadigan xabarlar (CAPTCHA, ogohlantirish/mute/ban) tilini tugma orqali tanlash |
+| `/premium` | Tarif holatini (bepul/premium) ko'rish va Telegram Stars orqali sotib olish |
+| `/exportsettings` | Joriy sozlamalarni JSON ko'rinishida olish (zaxira yoki boshqa guruhga ko'chirish uchun) |
+| `/importsettings {JSON}` | Eksport qilingan (yoki qo'lda tuzilgan) JSON'ni guruhga qo'llash |
+| `/clonesettings` | Bir guruh sozlamalarini boshqasiga nusxalash (manba va maqsad guruh tugmalar orqali tanlanadi) |
 | `/broadcast matn` | Boshqargan barcha guruhlaringizga botning o'zi orqali bitta e'lon/ogohlantirish yuborish |
 | `/audit [json\|mtproto]` | JSON/ZIP yuklash auditini yoki MTProto auditini boshlash |
 | `/audit_status` | Audit jarayoni va tekshirilgan xabarlar soni |
@@ -475,10 +514,15 @@ Natija (41 test, jumladan yangi tozalash/sweep oqimi):
 [39] testAuditCleanupCallbackRequiresAdmin                   ... ✅ [PASSED]
 [40] testMemberSweepFlagsAdultAndBotAccounts                 ... ✅ [PASSED]
 [41] testLocalPhaseDefersAiButActsOnDeterministicViolation   ... ✅ [PASSED]
+...
+[96] testMultiGroupCommandsOfferGroupButtonsInsteadOfRawChatId ... ✅ [PASSED]
+[97] testGroupButtonCallbackRunsActionAndLanguageButtonUpdatesSetting ... ✅ [PASSED]
+[98] testArgumentPickerRecoversOriginalWordFromReplyMessage  ... ✅ [PASSED]
+[99] testCloneSettingsTwoStepButtonFlowCopiesSettings        ... ✅ [PASSED]
 =========================================================
 Test Natijalari:
-• Jami testlar: 41
-• Muvaffaqiyatli: 41 ✅
+• Jami testlar: 99
+• Muvaffaqiyatli: 99 ✅
 • Xatolar: 0 🎉
 =========================================================
 ```

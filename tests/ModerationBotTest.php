@@ -3093,4 +3093,211 @@ class ModerationBotTest extends TestCase
         $this->assertEquals($expectedChatIds, $foundChatIds);
         $this->assertNull(QueueService::reserve('default'), "Aynan 3 ta job navbatga qo'yilgan bo'lishi kerak, ortiqcha emas");
     }
+
+    /**
+     * 2.0 Phase 5 (UX): bir nechta guruhni boshqaradigan admin endi uzun guruh
+     * ID'sini (`-100...`) qo'lda yozmasligi kerak — bot guruh tanlash TUGMALARINI
+     * chiqaradi. Har bir buyruq o'ziga mos picker prefiksini qaytaradi.
+     */
+    public function testMultiGroupCommandsOfferGroupButtonsInsteadOfRawChatId(): void
+    {
+        // Broadcast testidagi kabi: faqat shu testga xos admin ID va aynan
+        // 2 ta guruh (chat_members testlar orasida tozalanmaydi).
+        $adminId = 890200;
+        $chatIdA = -100890201;
+        $chatIdB = -100890202;
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        foreach ([$chatIdA, $chatIdB] as $cid) {
+            SettingsService::get($cid);
+            $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$cid}, {$adminId}, 'administrator', '{$now}')");
+        }
+
+        $router = new UpdateRouter();
+        $updateId = 999100;
+        $send = function (string $text) use ($router, $adminId, &$updateId): array {
+            return $router->handle([
+                'update_id' => ++$updateId,
+                'message' => [
+                    'message_id' => $updateId,
+                    'chat' => ['id' => $adminId, 'type' => 'private'],
+                    'from' => ['id' => $adminId, 'is_bot' => false, 'first_name' => 'Admin'],
+                    'text' => $text,
+                ],
+            ]);
+        };
+
+        $expected = [
+            '/premium' => 'admin_premium',
+            '/wordlist' => 'admin_wordlist',
+            '/modlist' => 'admin_modlist',
+            '/til' => 'admin_lang',
+            '/exportsettings' => 'admin_export',
+            '/blockword reklama' => 'argpick_word',
+        ];
+        foreach ($expected as $cmd => $picker) {
+            $res = $send($cmd);
+            $this->assertEquals('private_group_selection_required', $res['status'], "{$cmd} guruh tanlashni so'rashi kerak");
+            $this->assertEquals($picker, $res['picker'] ?? null, "{$cmd} uchun tugma prefiksi noto'g'ri");
+        }
+
+        // /clonesettings ham endi ikkita ID o'rniga manba guruh tugmalarini beradi.
+        $clone = $send('/clonesettings');
+        $this->assertEquals('private_group_selection_required', $clone['status']);
+        $this->assertEquals('admin_clonefrom', $clone['picker'] ?? null);
+    }
+
+    /**
+     * 2.0 Phase 5 (UX): guruh tugmasi bosilganda amal o'sha guruh uchun darhol
+     * bajarilishi, til tugmasi esa sozlamani haqiqatan o'zgartirishi kerak.
+     */
+    public function testGroupButtonCallbackRunsActionAndLanguageButtonUpdatesSetting(): void
+    {
+        $adminId = 890300;
+        $chatId = -100890301;
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        SettingsService::get($chatId);
+        $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$chatId}, {$adminId}, 'administrator', '{$now}')");
+
+        $router = new UpdateRouter();
+
+        // "⭐ Tarif" tugmasi — tarif holati ko'rsatilishi kerak.
+        $premium = $router->handle([
+            'update_id' => 999200,
+            'callback_query' => [
+                'id' => 'cb_prem',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => ['message_id' => 1, 'chat' => ['id' => $adminId, 'type' => 'private']],
+                'data' => "admin_premium:{$chatId}",
+            ],
+        ]);
+        $this->assertEquals('premium_status_shown', $premium['status']);
+        $this->assertEquals('free', $premium['plan']);
+
+        // Til tugmasi — sozlama darhol yangilanishi kerak.
+        $lang = $router->handle([
+            'update_id' => 999201,
+            'callback_query' => [
+                'id' => 'cb_lang',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => ['message_id' => 2, 'chat' => ['id' => $adminId, 'type' => 'private']],
+                'data' => "setlang:{$chatId}:ru",
+            ],
+        ]);
+        $this->assertEquals('setting_updated', $lang['status']);
+        $this->assertEquals('ru', SettingsService::get($chatId)['language']);
+
+        // Noma'lum til kodi — sozlama o'zgarmasligi kerak.
+        $bad = $router->handle([
+            'update_id' => 999202,
+            'callback_query' => [
+                'id' => 'cb_lang_bad',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => ['message_id' => 3, 'chat' => ['id' => $adminId, 'type' => 'private']],
+                'data' => "setlang:{$chatId}:xx",
+            ],
+        ]);
+        $this->assertEquals('invalid_language', $bad['status']);
+        $this->assertEquals('ru', SettingsService::get($chatId)['language'], "Noto'g'ri kod sozlamani buzmasligi kerak");
+    }
+
+    /**
+     * 2.0 Phase 5 (UX): argumentli buyruqlarda (masalan `/blockword so'z`) tugma
+     * bosilganda asl so'z tugmali xabarning `reply_to_message` maydonidan qayta
+     * o'qiladi — hech qanday qo'shimcha jadval/holat saqlanmaydi.
+     */
+    public function testArgumentPickerRecoversOriginalWordFromReplyMessage(): void
+    {
+        $adminId = 890400;
+        $chatId = -100890401;
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        SettingsService::get($chatId);
+        $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$chatId}, {$adminId}, 'administrator', '{$now}')");
+
+        $router = new UpdateRouter();
+
+        $res = $router->handle([
+            'update_id' => 999300,
+            'callback_query' => [
+                'id' => 'cb_word',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => [
+                    'message_id' => 11,
+                    'chat' => ['id' => $adminId, 'type' => 'private'],
+                    'reply_to_message' => ['message_id' => 10, 'text' => '/blockword reklama'],
+                ],
+                'data' => "argpick_word:{$chatId}",
+            ],
+        ]);
+        $this->assertEquals('command_executed', $res['status']);
+
+        $stmt = $pdo->prepare("SELECT COUNT(*) FROM word_rules WHERE chat_id = :cid AND word_pattern = 'reklama' AND rule_type = 'blacklist'");
+        $stmt->execute(['cid' => $chatId]);
+        $this->assertEquals(1, (int)$stmt->fetchColumn(), "Tugma orqali tanlangan guruhga so'z qoidasi qo'shilishi kerak");
+
+        // Asl xabar topilmasa — tushunarli xato qaytishi va hech narsa yozilmasligi kerak.
+        $missing = $router->handle([
+            'update_id' => 999301,
+            'callback_query' => [
+                'id' => 'cb_word2',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => ['message_id' => 12, 'chat' => ['id' => $adminId, 'type' => 'private']],
+                'data' => "argpick_word:{$chatId}",
+            ],
+        ]);
+        $this->assertEquals('argpick_original_missing', $missing['status']);
+    }
+
+    /**
+     * 2.0 Phase 5 (UX): sozlamalarni klonlash endi ikkita uzun ID o'rniga
+     * ikki bosqichli tugmali oqim — manba tanlanadi, so'ng maqsad.
+     */
+    public function testCloneSettingsTwoStepButtonFlowCopiesSettings(): void
+    {
+        $adminId = 890500;
+        $sourceChatId = -100890501;
+        $targetChatId = -100890502;
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        foreach ([$sourceChatId, $targetChatId] as $cid) {
+            SettingsService::get($cid);
+            $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$cid}, {$adminId}, 'administrator', '{$now}')");
+        }
+        SettingsService::update($sourceChatId, ['warn_limit' => 7, 'link_filter' => 0, 'language' => 'en']);
+
+        $router = new UpdateRouter();
+
+        // 1-bosqich: manba guruh tugmasi bosildi — maqsad guruh tugmalari chiqadi.
+        $step1 = $router->handle([
+            'update_id' => 999400,
+            'callback_query' => [
+                'id' => 'cb_clone1',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => ['message_id' => 21, 'chat' => ['id' => $adminId, 'type' => 'private']],
+                'data' => "admin_clonefrom:{$sourceChatId}",
+            ],
+        ]);
+        $this->assertEquals('clone_target_picker_sent', $step1['status']);
+        $this->assertEquals($sourceChatId, $step1['source_chat_id']);
+
+        // 2-bosqich: maqsad guruh tugmasi bosildi — sozlamalar ko'chirilishi kerak.
+        $step2 = $router->handle([
+            'update_id' => 999401,
+            'callback_query' => [
+                'id' => 'cb_clone2',
+                'from' => ['id' => $adminId, 'first_name' => 'Admin'],
+                'message' => ['message_id' => 22, 'chat' => ['id' => $adminId, 'type' => 'private']],
+                'data' => "cloneto:{$sourceChatId}:{$targetChatId}",
+            ],
+        ]);
+        $this->assertEquals('command_executed', $step2['status']);
+        $this->assertEquals('/clonesettings', $step2['cmd']);
+
+        $target = SettingsService::get($targetChatId);
+        $this->assertEquals(7, (int)$target['warn_limit']);
+        $this->assertEquals(0, (int)$target['link_filter']);
+        $this->assertEquals('en', $target['language']);
+    }
 }

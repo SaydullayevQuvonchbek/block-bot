@@ -4,6 +4,33 @@ Ushbu loyiha [Semantic Versioning](https://semver.org/lang/ru/) tartibiga amal q
 
 ## [Unreleased] — v2.0.0-dev
 
+### O'zgartirildi
+- **Foydalanish qulayligi: guruh ID'sini qo'lda yozish bekor qilindi (2.0 Phase 5 — UX)**:
+  avval bir nechta guruhni boshqaradigan admin `/premium`, `/til`, `/wordlist`,
+  `/modlist`, `/exportsettings`, `/blockword`, `/importsettings` buyruqlarida
+  `-1002341052295` kabi uzun guruh ID'sini QO'LDA ko'chirib yozishi kerak edi —
+  bu amalda juda noqulay bo'lib chiqdi. Endi bot bunday holatda **guruh tanlash
+  tugmalarini** chiqaradi va bir bosishda amal bajariladi. Argument talab
+  qiladigan buyruqlarda (`/blockword so'z`, `/importsettings {JSON}`) tugmali
+  xabar foydalanuvchining asl buyrug'iga *javob* (reply) sifatida yuboriladi —
+  tugma bosilganda asl matn `callback_query.message.reply_to_message`dan qayta
+  o'qiladi, shuning uchun hech qanday yangi jadval yoki "kutilayotgan amal"
+  holati saqlanmaydi (migratsiya talab qilinmaydi).
+- **Phase 3-4 funksiyalari sozlamalar paneliga ko'chirildi (2.0 Phase 5 — UX)**:
+  til, tarif (Premium), so'zlar ro'yxati, moderatorlar, sozlamalar eksporti va
+  boshqa guruhga nusxalash — barchasi endi mavjud `⚙️ Guruh sozlamalari`
+  tugmalar panelida. Ish oqimi yagona bo'ldi: `/mygroups` → guruh → hamma narsa
+  bitta panelda, matnli buyruq yozish shart emas.
+- **`/til` va `/clonesettings` to'liq tugmali bo'ldi**: `/til` endi til kodini
+  yozishni so'ramaydi — 🇺🇿/🇷🇺/🇬🇧 tugmalari ko'rsatiladi (joriy til ✅ bilan
+  belgilanadi). `/clonesettings` ikkita uzun ID o'rniga ikki bosqichli tanlovga
+  o'tdi: avval manba guruh tugmasi, so'ng maqsad guruh tugmasi (maqsad
+  ro'yxatidan manba guruhning o'zi chiqarib tashlanadi).
+- Eski `/buyruq -100... argument` sintaksisi **saqlanib qoldi** — skript yoki
+  odatiga ko'ra ID bilan yozadiganlar uchun hech narsa buzilmadi. Testlar:
+  95 → **99** (yangi 4 ta test guruh tanlash tugmalari, til tugmasi,
+  `reply_to_message`dan argument tiklash va ikki bosqichli klonlashni qamraydi).
+
 ### Qo'shildi
 - **Ko'p tillilik / i18n (2.0 Phase 3, 1-band)**: guruh a'zolariga BEVOSITA
   ko'rinadigan xabarlar — yangi a'zo CAPTCHA'si (xush kelibsiz matni, tugma,

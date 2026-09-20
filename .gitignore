@@ -14,4 +14,3 @@ composer.phar
 *.session.lock
 /Claude outputs/
 BLOCKBOT_2.0_TAHLIL.md
-
