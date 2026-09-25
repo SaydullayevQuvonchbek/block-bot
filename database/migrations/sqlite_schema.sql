@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS group_settings (
     mute_2nd_duration_sec INTEGER NOT NULL DEFAULT 86400,
     porn_action TEXT NOT NULL DEFAULT 'ban',
     adult_account_action TEXT NOT NULL DEFAULT 'mute_notify',
+    spam_account_action TEXT NOT NULL DEFAULT 'mute_notify',
     history_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
     log_chat_id INTEGER NULL,
     custom_rules_json TEXT NULL,

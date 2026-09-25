@@ -15,6 +15,15 @@ class TextModerator
 {
     private OpenRouterClient $openRouter;
 
+    /**
+     * Oxirgi `checkUrls()` chaqiruvining qisqa tahlili (2.0 Phase 7):
+     * oq ro'yxatda bo'lmagan domen bormi va qisqartiruvchi xizmat ishlatilganmi.
+     * Oq ro'yxat hisobini ikki marta qilmaslik uchun shu yerda saqlanadi.
+     *
+     * @var array{has_unknown: bool, has_shortener: bool}
+     */
+    private array $lastLinkAnalysis = ['has_unknown' => false, 'has_shortener' => false];
+
     // Begunoh so'zlar ro'yxati (hech qachon bloklanmaydigan istisnolar)
     private const INNOCENT_EXCEPTIONS = [
         'qoshiq', 'qoshiqcha', 'kuchuk', 'kuchukcha', 'siklamen', 'shart', 'shartnoma',
@@ -48,6 +57,26 @@ class TextModerator
         'apk', 'mod apk', 'crack', 'obuna bo\'ling', 'kanalga qo\'shiling', 'reklama',
         'more of me', 'come closer', 'exclusive content', 'private channel', 'onlyfans', 'nudes',
     ];
+
+    /**
+     * Havola qisqartiruvchi xizmatlar (2.0 Phase 7 — fishing himoyasi).
+     * Bunday havola oxirgi manzilni BUTUNLAY yashiradi, shuning uchun uni
+     * oddiy noma'lum domen kabi "o'tkazib yuborish" mumkin emas — kamida AI
+     * tahliliga majburan yuboriladi.
+     */
+    private const URL_SHORTENERS = [
+        'tr.ee', 'bit.ly', 'bitly.com', 'tinyurl.com', 'cutt.ly', 'goo.gl', 'is.gd',
+        't.co', 'ow.ly', 'rb.gy', 'rebrand.ly', 'shorturl.at', 'clck.ru', 'vk.cc',
+        'surl.li', 'u.to', 'qr.ae', 'lnkd.in', 'buff.ly', 'shorte.st', 'linktr.ee',
+        'telegra.ph', 'teletype.in', 'dub.sh', 'short.io', 'tiny.cc', 's.id',
+    ];
+
+    /**
+     * Matnda ko'rinadigan, lekin aslida BOSHQA manzilga olib boradigan havolani
+     * aniqlash uchun domenga o'xshash bo'lakni topuvchi regex (2.0 Phase 7).
+     * Masalan ko'rinishi `gov.uz/viplat24sep`, haqiqiy manzili `tr.ee/xxxx`.
+     */
+    private const DOMAIN_IN_TEXT_PATTERN = '/\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:uz|ru|com|net|org|info|biz|site|online|xyz|top|io|co|me|kz|kg|tj|tm|az|ua|by|gov|edu))\b/i';
 
     /** @var array<int, array{pattern:string, category:string, reason:string}> */
     private const STRICT_POLICY_PATTERNS = [
@@ -120,12 +149,28 @@ class TextModerator
         }
 
         // 1. Havolalar va domenlarni tekshirish
+        $urls = [];
+        $hasShortener = false;
+        $hasUnknownLink = false;
         if ($filters['link_filter']) {
+            // 2.0 Phase 7: avval NIQOBLANGAN havola tekshiruvi — ko'rinadigan
+            // matn bir domenni ko'rsatib, haqiqiy havola boshqasiga olib borsa
+            // (masalan "gov.uz/..." deb yozilib, aslida "tr.ee/..."), bu deyarli
+            // har doim fishing bo'ladi.
+            $maskedFinding = $this->checkMaskedLinks($rawText, $entities);
+            if ($maskedFinding !== null) {
+                return $maskedFinding;
+            }
+
             $urls = TextNormalizer::extractUrls($rawText, $entities);
             $linkFinding = $this->checkUrls($urls, $chatId);
             if ($linkFinding !== null) {
                 return $linkFinding;
             }
+            // `checkUrls()` oq ro'yxatni allaqachon hisoblab chiqqan — uni qayta
+            // so'ramaslik uchun natijasidan foydalanamiz.
+            $hasShortener = (bool)($this->lastLinkAnalysis['has_shortener'] ?? false);
+            $hasUnknownLink = (bool)($this->lastLinkAnalysis['has_unknown'] ?? false);
         }
 
         // 2. Mahalliy so'z qoidalarini (DB va o'rnatilgan) tekshirish
@@ -141,9 +186,17 @@ class TextModerator
             }
         }
 
-        // 3. AI rejimi va shubha darajasini tekshirish
-        $needsAi = ($filters['profanity_filter'] || $filters['porn_filter'])
-            && (($aiMode === 'comprehensive') || $this->hasSuspiciousContext($normalized, $collapsed));
+        // 3. AI rejimi va shubha darajasini tekshirish.
+        // 2.0 Phase 7: avval bu shart faqat so'kinish/porno filtrlariga bog'liq
+        // edi — ya'ni sof fishing/reklama havolasi bo'lgan xabar "economical"
+        // rejimda AI'ga UMUMAN yetib bormasdi. Endi havola filtri yoqilgan
+        // bo'lsa, havolali xabar ham AI tahlilига tushadi (qisqartirilgan
+        // havola esa har doim shubhali hisoblanadi).
+        $needsAi = ($filters['profanity_filter'] || $filters['porn_filter'] || $filters['link_filter'])
+            && (($aiMode === 'comprehensive')
+                || $this->hasSuspiciousContext($normalized, $collapsed)
+                || $hasShortener
+                || $hasUnknownLink);
 
         if (!$needsAi || $aiMode === 'disabled') {
             return [
@@ -176,8 +229,20 @@ class TextModerator
             return $cached;
         }
 
-        // 5. Tanlangan AI provider orqali tekshirish
-        $aiResult = $this->openRouter->moderateText($rawText, $itemId, $chatId, $customModel);
+        // 5. Tanlangan AI provider orqali tekshirish.
+        // 2.0 Phase 7: AI'ga faqat KO'RINADIGAN matn yuborilardi — Telegram
+        // `text_link` entity'si ichidagi HAQIQIY manzil esa yashirin qolardi.
+        // Natijada "gov.uz/..." deb ko'rsatilgan, aslida qisqartiruvchi xizmatga
+        // olib boradigan fishing xabari AI uchun butunlay qonuniy ko'rinardi.
+        // Endi haqiqiy havolalar matnga alohida ilova sifatida qo'shiladi.
+        $aiText = $rawText;
+        if ($urls !== []) {
+            $aiText .= "\n\n[Tizim ilovasi — xabardagi HAQIQIY havolalar: " . implode(', ', array_slice($urls, 0, 10)) . "]";
+            if ($hasShortener) {
+                $aiText .= "\n[Diqqat: havola qisqartiruvchi xizmat ishlatilgan — oxirgi manzil yashirilgan.]";
+            }
+        }
+        $aiResult = $this->openRouter->moderateText($aiText, $itemId, $chatId, $customModel);
         $aiResult['source'] = $provider . '_ai';
 
         if (in_array(($aiResult['category'] ?? ''), ['pornography', 'adult_profile'], true) && !$filters['porn_filter']) {
@@ -196,8 +261,67 @@ class TextModerator
     /**
      * Havolalarni taqiqlangan/ruxsat etilgan domenlar ro'yxatiga solishtirish
      */
+    /**
+     * NIQOBLANGAN HAVOLA tekshiruvi (2.0 Phase 7 — fishing himoyasi).
+     *
+     * Telegram'da havolani istalgan matn ostiga yashirish mumkin (`text_link`
+     * entity'si): foydalanuvchi `gov.uz/viplat24sep` deb yozilganini ko'radi,
+     * bosganda esa `tr.ee/Iv0aPh` ga tushadi. Davlat saytlari, banklar va
+     * to'lov tizimlari nomidan qilinadigan firibgarliklar deyarli har doim
+     * shu usulda ishlaydi.
+     *
+     * Qoida: ko'rinadigan matnda domenga o'xshash bo'lak bo'lsa va u haqiqiy
+     * havolaning hostiga MOS KELMASA — bu niqoblangan havola.
+     */
+    private function checkMaskedLinks(string $text, array $entities): ?array
+    {
+        foreach ($entities as $entity) {
+            if (($entity['type'] ?? '') !== 'text_link' || empty($entity['url'])) {
+                continue;
+            }
+
+            $visible = mb_substr($text, (int)($entity['offset'] ?? 0), (int)($entity['length'] ?? 0), 'UTF-8');
+            if (!preg_match(self::DOMAIN_IN_TEXT_PATTERN, $visible, $m)) {
+                // Ko'rinadigan matnda domen umuman yo'q ("Batafsil" kabi) —
+                // bu normal holat, niqoblash deb hisoblanmaydi.
+                continue;
+            }
+
+            $claimedHost = $this->registrableHost(strtolower($m[1]));
+            $actualHost = $this->registrableHost(strtolower((string)(parse_url((string)$entity['url'], PHP_URL_HOST) ?? '')));
+
+            if ($claimedHost === '' || $actualHost === '' || $claimedHost === $actualHost) {
+                continue;
+            }
+
+            return [
+                'status' => 'unsafe',
+                'category' => 'malicious_link',
+                'reason' => "Niqoblangan havola: matnda \"{$claimedHost}\" ko'rsatilgan, "
+                    . "lekin havola aslida \"{$actualHost}\" manziliga olib boradi (fishing belgisi)",
+                'evidence' => trim($visible) . ' → ' . (string)$entity['url'],
+                'source' => 'link_filter_masked',
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * Hostni solishtirish uchun normallashtirish: "www." prefiksi olib
+     * tashlanadi. Subdomenlar ataylab saqlanadi — "gov.uz" va
+     * "gov.uz.scam-site.xyz" bir xil deb hisoblanmasligi kerak.
+     */
+    private function registrableHost(string $host): string
+    {
+        $host = trim($host, " \t\n\r\0\x0B.");
+        return str_starts_with($host, 'www.') ? substr($host, 4) : $host;
+    }
+
     private function checkUrls(array $urls, ?int $chatId): ?array
     {
+        $this->lastLinkAnalysis = ['has_unknown' => false, 'has_shortener' => false];
+
         if (empty($urls)) {
             return null;
         }
@@ -250,6 +374,14 @@ class TextModerator
             }
             if ($isWhitelisted) {
                 continue;
+            }
+
+            // 2.0 Phase 7: oq ro'yxatda bo'lmagan domen — AI tahliliga arziydi
+            // (avval bunday havola qora ro'yxatda bo'lmasa, jim o'tkazib
+            // yuborilardi va "economical" rejimda AI umuman chaqirilmasdi).
+            $this->lastLinkAnalysis['has_unknown'] = true;
+            if (in_array($this->registrableHost($host), self::URL_SHORTENERS, true)) {
+                $this->lastLinkAnalysis['has_shortener'] = true;
             }
 
             // Qora ro'yxatdagi domenlar

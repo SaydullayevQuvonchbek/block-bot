@@ -398,6 +398,65 @@ premium sotib olish ishlamaydi).
 
 ---
 
+## 🎣 Fishing va niqoblangan havolalar himoyasi
+
+Telegram'da havolani **istalgan matn ostiga** yashirish mumkin: foydalanuvchi
+`gov.uz/viplat24sep` deb yozilganini ko'radi, bosganda esa `tr.ee/Iv0aPh` ga
+tushadi. Davlat idoralari, banklar va to'lov tizimlari nomidan qilinadigan
+firibgarliklar deyarli har doim shu usulda ishlaydi.
+
+Bot bunday xabarni **darhol o'chiradi** va ogohlantirish beradi:
+
+- **Niqoblangan havola** — ko'rinadigan matndagi domen haqiqiy manzilga mos
+  kelmasa. Subdomen bilan aldash ham ushlanadi (ko'rinishi `gov.uz`, aslida
+  `gov.uz.scam-site.xyz`).
+- **Qisqartiruvchi xizmatlar** — `tr.ee`, `bit.ly`, `cutt.ly`, `clck.ru`,
+  `t.co`, `telegra.ph` va boshqalar oxirgi manzilni yashirgani uchun hech
+  qachon jim o'tkazilmaydi, majburan AI tahliliga yuboriladi.
+- **AI haqiqiy manzilni ko'radi** — xabar matniga haqiqiy URL'lar tizim ilovasi
+  sifatida qo'shiladi, shuning uchun AI "gov.uz deb yozilgan, lekin havola
+  boshqa joyga ketyapti" degan xulosaga kela oladi.
+
+Halol havolalar bloklanmaydi: ko'rinishi va manzili bir xil bo'lsa
+(`kun.uz` → `kun.uz/news/123`) yoki oq ro'yxatdagi domen bo'lsa, xabar
+avvalgidek erkin o'tadi.
+
+> Bu himoya `link_filter` sozlamasi yoqilgan bo'lsa ishlaydi — sozlamalar
+> panelida **"Havola (link) filtri"** ✅ turganiga ishonch hosil qiling.
+
+## 🕵️ Yangi a'zo akkauntini avtomatik tekshirish (AI)
+
+Guruhga yangi a'zo qo'shilishi bilan bot uni **fon rejimida, hech kimdan hech
+narsa so'ramasdan** tekshiradi (`profile_scan` yoqilgan bo'lsa). Tekshiriladigan
+narsalar:
+
+- **Ism, familiya, username** — AI tahlili
+- **Profil "bio" (about) matni** — reklama/skam akkauntlar targ'ibotni odatda
+  aynan shu yerda saqlaydi (kanal havolasi, "investitsiya" takliflari, referal
+  kodlari)
+- **Profil rasmi** — 18+ kontent uchun AI vision tekshiruvi
+- **Bot akkaunt belgisi** — admin qo'shmagan botlar (`bot_filter`)
+
+Aniqlanadigan toifalar: 18+ profillar, kripto/forex **"treyder signal"**
+targ'ibotchilari, kazino/bukmeker reklamasi, referal/reklama spam tarqatuvchilar,
+zararli havola va APK tarqatuvchilar, ruxsatsiz bot akkauntlar.
+
+Chora ikkita **alohida** sozlama bilan boshqariladi — ikkalasi ham sozlamalar
+panelidagi tugmadan o'zgartiriladi:
+
+| Toifa | Sozlama | Standart |
+|---|---|---|
+| 18+ profil / ruxsatsiz bot | `adult_account_action` | 🔇 mute + adminga xabar |
+| Reklama / skam / treyding targ'iboti | `spam_account_action` | 🔇 mute + adminga xabar |
+
+Har ikkalasi uchun uchta variant bor: `notify` (faqat adminga xabar + "Ban"
+tugmasi), `mute_notify` (30 kunga mute + adminga tasdiq tugmasi), `ban` (darhol
+chetlatish).
+
+> Bu qatlam **CAPTCHA'dan mustaqil** ishlaydi. CAPTCHA (`❌`/`✅ Yangi a'zo
+> CAPTCHA`) — yangi a'zodan tugma bosishni talab qiladigan qo'shimcha to'siq;
+> o'chirilgan bo'lsa ham yuqoridagi avtomatik tekshiruv ishlayveradi.
+
 ## 🖱 Hammasi tugmalar orqali — guruh ID yozish shart emas
 
 Bot bilan ishlashning **asosiy yo'li — shaxsiy chatdagi tugmalar**, matnli
@@ -519,10 +578,12 @@ Natija (41 test, jumladan yangi tozalash/sweep oqimi):
 [97] testGroupButtonCallbackRunsActionAndLanguageButtonUpdatesSetting ... ✅ [PASSED]
 [98] testArgumentPickerRecoversOriginalWordFromReplyMessage  ... ✅ [PASSED]
 [99] testCloneSettingsTwoStepButtonFlowCopiesSettings        ... ✅ [PASSED]
+[100] testProfileScanFlagsTradingPromoAccountFromNameAndBio   ... ✅ [PASSED]
+[101] testSpamAccountActionSettingIsIndependentFromAdultSetting ... ✅ [PASSED]
 =========================================================
 Test Natijalari:
-• Jami testlar: 99
-• Muvaffaqiyatli: 99 ✅
+• Jami testlar: 103
+• Muvaffaqiyatli: 103 ✅
 • Xatolar: 0 🎉
 =========================================================
 ```

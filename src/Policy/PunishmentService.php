@@ -267,6 +267,117 @@ class PunishmentService
         return $stmt->execute(['cid' => $chatId, 'uid' => $userId]);
     }
 
+    /**
+     * Ichki amal kodlarini adminга tushunarli o'zbekcha matnga aylantirish
+     * (2.0 Phase 7). Avval xabarda "REVIEW_ONLY" kabi xom kodlar chiqardi.
+     */
+    private const ACTION_LABELS = [
+        'warn_user' => "⚠️ Ogohlantirish berildi",
+        'mute_user' => "🔇 Vaqtincha yozish taqiqlandi",
+        'ban_user' => "⛔ Guruhdan chetlatildi",
+        'delete_only' => "🗑 Xabar o'chirildi",
+        'alert_only' => "👀 Chora ko'rilmadi — admin qaroriga qoldirildi",
+        'review_only' => "👀 Chora ko'rilmadi — qo'lda ko'rib chiqish kerak",
+    ];
+
+    /**
+     * Texnik/provayder atamalarini odamcha tushuntirishga almashtirish
+     * (2.0 Phase 7). Masalan "PROHIBITED_CONTENT" admin uchun hech narsa
+     * anglatmaydi.
+     */
+    private const REASON_HUMANIZE = [
+        "Gemini xavfsizlik filtri javobni blokladi: PROHIBITED_CONTENT"
+            => "AI kontentni tekshirishdan bosh tortdi (taqiqlangan kontent belgisi) — odatda 18+ yoki zo'ravonlik",
+        "Gemini xavfsizlik filtri javobni blokladi: SAFETY"
+            => "AI kontentni xavfli deb baholab, tahlil qilishdan bosh tortdi",
+        "Gemini xavfsizlik filtri javobni blokladi: IMAGE_SAFETY"
+            => "AI rasmni xavfli deb baholab, tahlil qilishdan bosh tortdi",
+        "Gemini xavfsizlik filtri javobni blokladi: BLOCKLIST"
+            => "AI provayderining taqiqlangan so'zlar ro'yxati ishga tushdi",
+        "Gemini xavfsizlik filtri jinsiy kontentni aniqladi"
+            => "AI jinsiy (18+) kontent aniqladi",
+        'free_tier_limit_reached'
+            => "bepul tarifning kunlik AI chegarasi tugagan",
+        'budget_exhausted'
+            => "AI byudjeti tugagan",
+    ];
+
+    private function humanizeReason(string $reason): string
+    {
+        foreach (self::REASON_HUMANIZE as $technical => $human) {
+            if (str_contains($reason, $technical)) {
+                $reason = str_replace($technical, $human, $reason);
+            }
+        }
+        return $reason;
+    }
+
+    /** Guruh nomini olish (topilmasa ID bilan qaytaradi). */
+    private function lookupGroupTitle(int $chatId): string
+    {
+        try {
+            $stmt = Database::getConnection()->prepare("SELECT title FROM `groups` WHERE chat_id = :cid");
+            $stmt->execute(['cid' => $chatId]);
+            $title = (string)($stmt->fetchColumn() ?: '');
+            return $title !== '' ? $title : "Guruh {$chatId}";
+        } catch (Throwable) {
+            return "Guruh {$chatId}";
+        }
+    }
+
+    /** Foydalanuvchining ismi va @username'i (topilmasa ID). */
+    private function lookupUserLabel(int $userId): string
+    {
+        try {
+            $stmt = Database::getConnection()->prepare(
+                "SELECT first_name, last_name, username FROM users WHERE user_id = :uid"
+            );
+            $stmt->execute(['uid' => $userId]);
+            $row = $stmt->fetch();
+            if (!$row) {
+                return (string)$userId;
+            }
+            $name = trim((string)($row['first_name'] ?? '') . ' ' . (string)($row['last_name'] ?? ''));
+            $username = trim((string)($row['username'] ?? ''));
+            if ($name === '' && $username === '') {
+                return (string)$userId;
+            }
+            if ($username !== '') {
+                return $name !== '' ? "{$name} (@{$username})" : "@{$username}";
+            }
+            return $name;
+        } catch (Throwable) {
+            return (string)$userId;
+        }
+    }
+
+    /** Qoidani buzgan xabarning matni (agar saqlangan bo'lsa). */
+    private function lookupMessageText(int $chatId, ?int $messageId): ?string
+    {
+        if (($messageId ?? 0) <= 0) {
+            return null;
+        }
+        try {
+            $stmt = Database::getConnection()->prepare(
+                "SELECT raw_text, media_type FROM messages WHERE chat_id = :cid AND message_id = :mid"
+            );
+            $stmt->execute(['cid' => $chatId, 'mid' => $messageId]);
+            $row = $stmt->fetch();
+            if (!$row) {
+                return null;
+            }
+            $text = trim((string)($row['raw_text'] ?? ''));
+            if ($text !== '') {
+                return $text;
+            }
+            // Matnsiz media uchun hech bo'lmasa turini ko'rsatamiz.
+            $mediaType = (string)($row['media_type'] ?? '');
+            return $mediaType !== '' && $mediaType !== 'text' ? "[{$mediaType}]" : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     private function notifyAdminLog(
         int $chatId,
         int $userId,
@@ -279,18 +390,44 @@ class PunishmentService
         ?int $messageId,
         bool $messageAlreadyDeleted = false
     ): void {
-        $statusEmoji = $success ? '✅' : '❌ Xatolik yuz berdi';
-        $logText = "🛡 <b>Moderatsiya Harakati:</b>\n"
-            . "• Guruh ID: <code>{$chatId}</code>\n"
-            . "• Foydalanuvchi: <a href=\"tg://user?id={$userId}\">{$userId}</a>\n"
-            . "• Harakat ID: <code>{$actionId}</code>\n"
-            . (($messageId ?? 0) > 0 ? "• Xabar ID: <code>{$messageId}</code>\n" : '')
-            . "• Amal: <b>" . strtoupper($action) . "</b> ({$statusEmoji})\n"
-            . "• Sabab: " . htmlspecialchars($reason, ENT_QUOTES, 'UTF-8') . "\n";
+        // 2.0 Phase 7: admin xabari avval faqat raqamlardan iborat edi
+        // ("Guruh ID: -100...", "Foydalanuvchi: 8412100749", "Amal: REVIEW_ONLY")
+        // — admin qaysi guruh, kim va nima yozganini umuman tushunolmasdi.
+        // Endi nomlar, xabar matni va odamcha tushuntirish ko'rsatiladi.
+        $groupTitle = $this->lookupGroupTitle($chatId);
+        $userLabel = $this->lookupUserLabel($userId);
+        $messageText = $this->lookupMessageText($chatId, $messageId);
+
+        $actionLabel = self::ACTION_LABELS[$action] ?? strtoupper($action);
+        $statusSuffix = $success ? '' : " — ❌ <b>bajarib bo'lmadi</b>";
+
+        $logText = "🛡 <b>Moderatsiya harakati</b>\n\n"
+            . "👥 <b>Guruh:</b> " . htmlspecialchars($groupTitle, ENT_QUOTES, 'UTF-8') . "\n"
+            . "👤 <b>Kim:</b> <a href=\"tg://user?id={$userId}\">"
+                . htmlspecialchars($userLabel, ENT_QUOTES, 'UTF-8') . "</a>\n"
+            . "⚖️ <b>Nima qilindi:</b> {$actionLabel}{$statusSuffix}\n"
+            . "📋 <b>Nima uchun:</b> " . htmlspecialchars($this->humanizeReason($reason), ENT_QUOTES, 'UTF-8') . "\n";
+
+        if ($messageText !== null && trim($messageText) !== '') {
+            $snippet = mb_substr(trim($messageText), 0, 400);
+            if (mb_strlen(trim($messageText)) > 400) {
+                $snippet .= '…';
+            }
+            $logText .= "\n💬 <b>Xabar matni:</b>\n<blockquote>"
+                . htmlspecialchars($snippet, ENT_QUOTES, 'UTF-8') . "</blockquote>\n";
+        }
 
         if (!empty($evidence)) {
-            $logText .= "• Dalil: <code>" . htmlspecialchars(mb_substr($evidence, 0, 100), ENT_QUOTES, 'UTF-8') . "</code>\n";
+            $logText .= "\n🔍 <b>Dalil:</b> <code>"
+                . htmlspecialchars(mb_substr($evidence, 0, 150), ENT_QUOTES, 'UTF-8') . "</code>\n";
         }
+
+        // Texnik ma'lumotlar — kerak bo'lganda qidirish uchun, lekin eng oxirida
+        // va kichik shriftda, asosiy mazmunni to'sib qo'ymasin.
+        $logText .= "\n<i>#" . $actionId
+            . " · guruh <code>{$chatId}</code>"
+            . (($messageId ?? 0) > 0 ? " · xabar <code>{$messageId}</code>" : '')
+            . " · foydalanuvchi <code>{$userId}</code></i>";
 
         // Rollback tugmalari
         $buttons = [

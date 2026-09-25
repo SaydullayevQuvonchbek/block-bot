@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Policy;
 
 use App\Core\Database;
+use App\Moderation\ProfileModerator;
 use PDO;
 use Throwable;
 
@@ -61,10 +62,23 @@ class ModerationDecisionService
         // 18+ profil va ruxsatsiz bot akkauntlar: bosqichma-bosqich emas, akkaunt darajasidagi
         // chora. Standart siyosat — mute qilib, adminга yakuniy "Ban" tugmasini yuborish.
         $isProfileSource = str_starts_with((string)($finding['source'] ?? ''), 'profile_');
+        // 2.0 Phase 6: profil tekshiruvida topilgan reklama/skam akkauntlar
+        // (kripto-"treyder" signallari, investitsiya/kazino targ'iboti, referal
+        // spam, reklama tarqatuvchi "chat-bot" akkauntlari) ham akkaunt
+        // darajasidagi choraga olib keladi — lekin ALOHIDA sozlama orqali
+        // (`spam_account_action`), chunki bu 18+ akkauntdan boshqa toifa va
+        // admin ular uchun boshqacha qattiqlik tanlashi mumkin.
+        $isPromoAccount = $isProfileSource && in_array($category, ProfileModerator::PROMO_CATEGORIES, true);
         if ($category === 'adult_profile' || $category === 'bot_account'
-            || ($category === 'pornography' && $isProfileSource)) {
-            $accountAction = (string)($settings['adult_account_action'] ?? 'mute_notify');
-            $label = $category === 'bot_account' ? "Ruxsatsiz bot akkaunt" : "18+ profil akkaunt";
+            || ($category === 'pornography' && $isProfileSource) || $isPromoAccount) {
+            $accountAction = $isPromoAccount
+                ? (string)($settings['spam_account_action'] ?? 'mute_notify')
+                : (string)($settings['adult_account_action'] ?? 'mute_notify');
+            $label = match (true) {
+                $category === 'bot_account' => "Ruxsatsiz bot akkaunt",
+                $isPromoAccount => "Reklama/skam akkaunt",
+                default => "18+ profil akkaunt",
+            };
             $deleteMessage = $messageId !== null && $messageId > 0;
 
             if ($accountAction === 'ban') {

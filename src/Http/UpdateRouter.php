@@ -25,6 +25,18 @@ use Throwable;
 
 class UpdateRouter
 {
+    /**
+     * Akkaunt darajasidagi chora turlari (18+ va reklama/skam akkauntlar uchun)
+     * — sozlamalar panelidagi tugmada ko'rsatiladigan qisqa nomlar va aylanish
+     * tartibi (2.0 Phase 6).
+     */
+    private const ACCOUNT_ACTION_LABELS = [
+        'notify' => '🔔 faqat xabar',
+        'mute_notify' => '🔇 mute + xabar',
+        'ban' => '⛔ darhol ban',
+    ];
+    private const ACCOUNT_ACTION_CYCLE = ['notify', 'mute_notify', 'ban'];
+
     private TelegramClient $telegram;
     private AdminAuthorizationService $auth;
     private PunishmentService $punishment;
@@ -679,6 +691,7 @@ class UpdateRouter
             'unscannable_action' => ['leave_alert', 'delete_notify'],
             'porn_action' => ['ban', 'mute', 'warn'],
             'adult_account_action' => ['ban', 'notify', 'mute_notify'],
+            'spam_account_action' => ['ban', 'notify', 'mute_notify'],
             'language' => Translator::SUPPORTED,
         ];
         $intRangeFields = [
@@ -1317,6 +1330,18 @@ class UpdateRouter
             $settingKey = substr($action, 4);
             $currentSettings = SettingsService::get($chatId);
 
+            // 2.0 Phase 6: reklama/skam akkaunt chorasini aylantirib tanlash.
+            if ($settingKey === 'spam_account_action') {
+                $current = (string)($currentSettings['spam_account_action'] ?? 'mute_notify');
+                $idx = array_search($current, self::ACCOUNT_ACTION_CYCLE, true);
+                $next = self::ACCOUNT_ACTION_CYCLE[(($idx === false ? 0 : (int)$idx) + 1) % count(self::ACCOUNT_ACTION_CYCLE)];
+                SettingsService::update($chatId, ['spam_account_action' => $next]);
+                $this->telegram->answerCallbackQuery($cbId, "Reklama/skam akkaunt: " . self::ACCOUNT_ACTION_LABELS[$next]);
+                $messageChatId = (int)($cb['message']['chat']['id'] ?? $chatId);
+                $this->sendSettingsMenu($chatId, $cb['message']['message_id'] ?? null, $messageChatId);
+                return ['status' => 'setting_updated', 'spam_account_action' => $next];
+            }
+
             if ($settingKey === 'ai_mode') {
                 $newMode = ($currentSettings['ai_mode'] ?? 'comprehensive') === 'comprehensive' ? 'economical' : 'comprehensive';
                 SettingsService::update($chatId, ['ai_mode' => $newMode]);
@@ -1881,6 +1906,10 @@ class UpdateRouter
                 ],
                 [
                     ['text' => (($s['ai_mode'] ?? '') === 'comprehensive' ? '🧠' : '⚡') . " AI: " . ($s['ai_mode'] ?? 'comprehensive'), 'callback_data' => "set_ai_mode:{$chatId}"],
+                ],
+                [
+                    // 2.0 Phase 6: reklama/skam akkauntlarga qanday chora ko'rilsin.
+                    ['text' => '📣 Reklama/skam akkaunt: ' . self::ACCOUNT_ACTION_LABELS[(string)($s['spam_account_action'] ?? 'mute_notify')], 'callback_data' => "set_spam_account_action:{$chatId}"],
                 ],
                 [
                     ['text' => '👥 A\'zolarni tekshirish (18+ / bot)', 'callback_data' => "admin_scan_members:{$chatId}"],

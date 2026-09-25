@@ -4,6 +4,76 @@ Ushbu loyiha [Semantic Versioning](https://semver.org/lang/ru/) tartibiga amal q
 
 ## [Unreleased] — v2.0.0-dev
 
+### Tuzatildi (Phase 7 — admin xabari o'qilishi)
+- **Adminga boradigan moderatsiya xabari tushunarsiz edi** — faqat raqamlardan
+  iborat bo'lib, "Guruh ID: -1002341052295", "Foydalanuvchi: 8412100749",
+  "Amal: REVIEW_ONLY", "Sabab: ... PROHIBITED_CONTENT" ko'rinishida kelardi.
+  Admin qaysi guruh, kim va nima yozgani haqida hech narsa bilolmasdi.
+- Endi xabarda: **guruh nomi**, **foydalanuvchi ismi va @username'i**,
+  **qoidani buzgan xabar matni** (400 belgigacha, iqtibos blokida) va amalning
+  o'zbekcha tavsifi ("👀 Chora ko'rilmadi — qo'lda ko'rib chiqish kerak")
+  ko'rsatiladi. ID'lar yo'qolmadi — ular eng pastda, kichik shriftdagi texnik
+  qatorga ko'chirildi.
+- **Texnik atamalar tushuntiriladi**: masalan "Gemini xavfsizlik filtri javobni
+  blokladi: PROHIBITED_CONTENT" → "AI kontentni tekshirishdan bosh tortdi
+  (taqiqlangan kontent belgisi) — odatda 18+ yoki zo'ravonlik".
+
+### Tuzatildi (Phase 7 — fishing himoyasi)
+- **Niqoblangan havolalar o'tib ketardi.** Haqiqiy hodisa: guruhga
+  "gov.uz/viplat24sep" deb ko'rsatilgan, aslida `tr.ee/...` qisqartiruvchisiga
+  olib boradigan "35 000 000 so'mgacha davlat yordami" firibgarligi tushdi va
+  bot uni **bloklamadi**. Uchta mustaqil kamchilik aniqlandi:
+  1. `checkUrls()` faqat qora ro'yxatni tekshirardi — ko'rinadigan matn bilan
+     haqiqiy manzil solishtirilmasdi (Telegram `text_link` entity'si istalgan
+     matn ostiga istalgan havolani yashirishga imkon beradi).
+  2. AI'ga **faqat ko'rinadigan matn** yuborilardi — ya'ni AI "gov.uz" ni ko'rib,
+     xabarni qonuniy davlat e'loni deb hisoblagan; haqiqiy `tr.ee` manzili unga
+     umuman yetib bormasdi.
+  3. AI chaqirilishi sharti faqat so'kinish/porno filtrlariga bog'liq edi —
+     sof havolali fishing xabari "economical" rejimda AI'ga umuman tushmasdi.
+- **Yangi: niqoblangan havola tekshiruvi** (`link_filter_masked`) — ko'rinadigan
+  matndagi domen haqiqiy havola hostiga mos kelmasa, xabar darhol `malicious_link`
+  deb belgilanadi (o'chiriladi + ogohlantirish). Subdomen bilan aldash ham
+  ushlanadi: ko'rinishi "gov.uz", aslida "gov.uz.scam-site.xyz".
+- **Yangi: havola qisqartiruvchi xizmatlar ro'yxati** (`tr.ee`, `bit.ly`,
+  `cutt.ly`, `clck.ru`, `t.co`, `telegra.ph` va h.k.) — bunday havola oxirgi
+  manzilni yashirgani uchun endi hech qachon jim o'tkazilmaydi.
+- **AI endi haqiqiy havolalarni ko'radi**: xabar matniga tizim ilovasi sifatida
+  haqiqiy URL'lar (va qisqartiruvchi ishlatilgani haqida ogohlantirish)
+  qo'shib yuboriladi.
+- **AI chaqirilishi sharti kengaytirildi**: oq ro'yxatda bo'lmagan yoki
+  qisqartirilgan havola bo'lsa, AI tahlili "economical" rejimda ham ishga
+  tushadi. Oq ro'yxatdagi (`t.me`, `kun.uz` va h.k.) havolalar avvalgidek
+  AI'siz o'tadi — ortiqcha xarajat qo'shilmaydi.
+- Testlar: 101 → **103** (yangi testlar aynan o'tib ketgan hujumni qaytadan
+  o'ynatadi va halol havolalar bloklanmasligini ham tekshiradi).
+
+### Qo'shildi (Phase 6)
+- **Yangi a'zo akkauntini AI orqali chuqurroq tekshirish**: avval profil
+  tekshiruvi faqat 18+ (`pornography`/`adult_profile`) va so'kinishga munosabat
+  bildirardi — AI akkauntni `trading_scam` (kripto/forex "signal" targ'iboti),
+  `spam_ad` (reklama/referal spam), `gambling` (kazino/bukmeker), `malicious_link`
+  yoki `apk_distribution` deb tasniflagan bo'lsa ham, natija **jim tashlab
+  yuborilardi**. Endi bu kategoriyalar ham akkaunt darajasidagi choraga olib
+  keladi (`ProfileModerator::PROMO_CATEGORIES`).
+- **Profil "bio" (about) matni endi tekshiriladi**: reklama/skam akkauntlar
+  odatda ismini toza qoldirib, butun targ'ibotni (kanal havolasi, "investitsiya"
+  takliflari, referal kodlari) aynan bio'da saqlaydi — avval bu matn umuman
+  o'qilmasdi. Bio `getChat(user_id)` orqali olinadi; bot foydalanuvchini
+  "ko'rmagan" yoki maxfiylik yopiq bo'lsa, bosqich jim o'tkazib yuboriladi
+  (hech qachon xatoga olib kelmaydi). Yangi manba kodi: `profile_scan_bio`.
+- **Yangi sozlama `spam_account_action`** (`notify` | `mute_notify` (standart) |
+  `ban`) — reklama/skam akkauntlarga qanday chora ko'rilishi. 18+ akkauntlar
+  uchun mavjud `adult_account_action`dan **mustaqil**, chunki bu boshqa toifa va
+  admin ular uchun boshqacha qattiqlik tanlashi mumkin. Sozlamalar panelida
+  yangi tugma orqali aylantirib tanlanadi. Migratsiya:
+  `database/migrations/009_profile_promo_scan.sql` (SQLite test sxemasi
+  `sqlite_schema_v9`).
+- Bu tekshiruv mavjud `profile_scan` kalitiga bo'ysunadi (o'chirilgan bo'lsa
+  umuman ishlamaydi) va yangi a'zo qo'shilganda avtomatik, hech kimdan hech
+  narsa so'ramasdan ishlaydi — CAPTCHA tugmasiga muqobil "jim" himoya qatlami.
+  Testlar: 99 → **101**.
+
 ### O'zgartirildi
 - **Foydalanish qulayligi: guruh ID'sini qo'lda yozish bekor qilindi (2.0 Phase 5 — UX)**:
   avval bir nechta guruhni boshqaradigan admin `/premium`, `/til`, `/wordlist`,

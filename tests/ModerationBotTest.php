@@ -3300,4 +3300,266 @@ class ModerationBotTest extends TestCase
         $this->assertEquals(0, (int)$target['link_filter']);
         $this->assertEquals('en', $target['language']);
     }
+
+    /**
+     * 2.0 Phase 6: yangi a'zo akkaunti AI orqali chuqurroq tekshiriladi —
+     * endi faqat 18+/so'kinish emas, reklama/skam toifalari ham (kripto
+     * "treyder" signallari, investitsiya/kazino targ'iboti, referal spam)
+     * hisobga olinadi. Bundan tashqari profil BIO matni ham tekshiriladi —
+     * bunday akkauntlar odatda ismini toza qoldirib, targ'ibotni bio'da
+     * saqlaydi.
+     */
+    public function testProfileScanFlagsTradingPromoAccountFromNameAndBio(): void
+    {
+        // AI o'rniga: berilgan matnda "signal/invest" bo'lsa trading_scam deydi.
+        $fakeAi = new class extends TextModerator {
+            public function __construct()
+            {
+            }
+            public function inspect(
+                string $rawText,
+                array $entities = [],
+                string $aiMode = 'economical',
+                ?int $chatId = null,
+                string $itemId = 'msg_1',
+                array $filters = [],
+                ?string $customModel = null,
+                bool $localOnly = false
+            ): array {
+                if (stripos($rawText, 'signal') !== false || stripos($rawText, 'invest') !== false) {
+                    return [
+                        'status' => 'unsafe',
+                        'category' => 'trading_scam',
+                        'reason' => 'Kripto/treyding signal targ\'iboti',
+                        'evidence' => $rawText,
+                        'source' => 'ai_text',
+                    ];
+                }
+                return ['status' => 'safe', 'category' => 'none', 'reason' => '', 'evidence' => '', 'source' => 'ai_text'];
+            }
+        };
+
+        // 1-holat: targ'ibot ISMDA.
+        $pmName = new ProfileModerator(null, $fakeAi);
+        $byName = $pmName->inspectUser(
+            ['id' => 940101, 'first_name' => 'Anna', 'last_name' => 'Crypto Signals'],
+            -100940100,
+            true
+        );
+        $this->assertEquals('unsafe', $byName['status'], "Treyding targ'iboti ismda ham aniqlanishi kerak");
+        $this->assertEquals('trading_scam', $byName['category']);
+        $this->assertEquals('profile_scan_name', $byName['source']);
+
+        // 2-holat: ism toza, targ'ibot faqat BIO'da — avval bu butunlay
+        // o'tkazib yuborilardi (bio umuman o'qilmasdi).
+        $telegramWithBio = new class extends TelegramClient {
+            public function getChat(int|string $chatId): ?array
+            {
+                return ['id' => $chatId, 'bio' => 'Kunlik invest signallari, 300% foyda — kanalga yoz'];
+            }
+        };
+        $pmBio = new ProfileModerator($telegramWithBio, $fakeAi);
+        $byBio = $pmBio->inspectUser(
+            ['id' => 940102, 'first_name' => 'Ali', 'last_name' => 'Valiyev'],
+            -100940100,
+            true
+        );
+        $this->assertEquals('unsafe', $byBio['status'], "Targ'ibot faqat bio'da bo'lsa ham aniqlanishi kerak");
+        $this->assertEquals('trading_scam', $byBio['category']);
+        $this->assertEquals('profile_scan_bio', $byBio['source']);
+
+        // 3-holat: toza akkaunt — bio bo'sh, ism oddiy.
+        $telegramNoBio = new class extends TelegramClient {
+            public function getChat(int|string $chatId): ?array
+            {
+                return ['id' => $chatId];
+            }
+        };
+        $pmClean = new ProfileModerator($telegramNoBio, $fakeAi);
+        $clean = $pmClean->inspectUser(
+            ['id' => 940103, 'first_name' => 'Dilnoza', 'last_name' => 'Karimova'],
+            -100940100,
+            true
+        );
+        $this->assertEquals('safe', $clean['status'], "Oddiy foydalanuvchi bezovta qilinmasligi kerak");
+    }
+
+    /**
+     * 2.0 Phase 6: reklama/skam akkauntlarga ko'riladigan chora ALOHIDA
+     * `spam_account_action` sozlamasi bilan boshqariladi (18+ akkauntlar uchun
+     * `adult_account_action`dan mustaqil).
+     */
+    public function testSpamAccountActionSettingIsIndependentFromAdultSetting(): void
+    {
+        $chatId = -100940200;
+        $userId = 940201;
+        SettingsService::get($chatId);
+
+        $finding = [
+            'status' => 'unsafe',
+            'category' => 'trading_scam',
+            'reason' => "Kripto signal targ'iboti",
+            'evidence' => 'Crypto Signals',
+            'source' => 'profile_scan_bio',
+        ];
+
+        // Standart holat — mute + adminga tasdiq tugmasi.
+        $default = ModerationDecisionService::decide($finding, $chatId, $userId, null, SettingsService::get($chatId));
+        $this->assertEquals('mute_user', $default['action']);
+        $this->assertStringContainsString('Reklama/skam akkaunt', $default['reason']);
+
+        // 18+ sozlamasi 'notify' bo'lsa ham, reklama/skam uchun 'ban' tanlangan
+        // bo'lsa — aynan ban qo'llanishi kerak (ikkalasi mustaqil).
+        SettingsService::update($chatId, ['adult_account_action' => 'notify', 'spam_account_action' => 'ban']);
+        $banned = ModerationDecisionService::decide($finding, $chatId, $userId, null, SettingsService::get($chatId));
+        $this->assertEquals('ban_user', $banned['action']);
+
+        // Teskarisi ham to'g'ri ishlashi kerak: 18+ akkaunt uchun 'notify'.
+        $adultFinding = array_merge($finding, ['category' => 'adult_profile', 'source' => 'profile_scan_photo']);
+        $adult = ModerationDecisionService::decide($adultFinding, $chatId, $userId, null, SettingsService::get($chatId));
+        $this->assertEquals('alert_only', $adult['action']);
+        $this->assertStringContainsString('18+ profil akkaunt', $adult['reason']);
+    }
+
+    /**
+     * 2.0 Phase 7: NIQOBLANGAN HAVOLA (fishing) himoyasi.
+     *
+     * Haqiqiy hodisa asosida: guruhga "gov.uz/viplat24sep" deb ko'rsatilgan,
+     * aslida `tr.ee/...` qisqartiruvchisiga olib boradigan "35 mln so'm davlat
+     * yordami" firibgarligi tushgan va bot uni O'TKAZIB YUBORGAN edi — chunki
+     * havola filtri faqat qora ro'yxatni tekshirardi, AI'ga esa faqat
+     * ko'rinadigan matn (ya'ni "gov.uz") yuborilardi.
+     */
+    public function testMaskedPhishingLinkIsBlockedButHonestLinksAreNot(): void
+    {
+        $moderator = new TextModerator();
+        $chatId = -100950100;
+
+        // 1. Aynan o'tib ketgan hujum turi: matnda gov.uz, ostida tr.ee.
+        $text = 'Ariza: gov.uz/viplat24sep';
+        $entities = [[
+            'type' => 'text_link',
+            'offset' => 7,
+            'length' => 18,
+            'url' => 'https://tr.ee/Iv0aPh',
+        ]];
+        $res = $moderator->inspect($text, $entities, 'economical', $chatId, 'ph1');
+        $this->assertEquals('unsafe', $res['status'], "Niqoblangan fishing havolasi bloklanishi shart");
+        $this->assertEquals('malicious_link', $res['category']);
+        $this->assertEquals('link_filter_masked', $res['source']);
+        $this->assertStringContainsString('gov.uz', $res['reason']);
+        $this->assertStringContainsString('tr.ee', $res['reason']);
+
+        // 2. Subdomen bilan aldash ham ushlanishi kerak: ko'rinishi "gov.uz",
+        // aslida "gov.uz.scam-site.xyz" (bu butunlay boshqa sayt).
+        $res2 = $moderator->inspect('Manzil: gov.uz', [[
+            'type' => 'text_link',
+            'offset' => 8,
+            'length' => 6,
+            'url' => 'https://gov.uz.scam-site.xyz/form',
+        ]], 'economical', $chatId, 'ph2');
+        $this->assertEquals('unsafe', $res2['status'], "Subdomen bilan aldash ham niqoblash hisoblanadi");
+        $this->assertEquals('link_filter_masked', $res2['source']);
+
+        // 3. HALOL havola — ko'rinadigan domen haqiqiy domen bilan bir xil
+        // (va oq ro'yxatda) — hech narsa qilinmasligi kerak.
+        $res3 = $moderator->inspect('Yangilik: kun.uz', [[
+            'type' => 'text_link',
+            'offset' => 10,
+            'length' => 6,
+            'url' => 'https://kun.uz/news/12345',
+        ]], 'economical', $chatId, 'ph3');
+        $this->assertEquals('safe', $res3['status'], "Ko'rinishi va manzili bir xil bo'lgan havola bloklanmasligi kerak");
+
+        // 4. Ko'rinadigan matnda domen YO'Q ("Batafsil") — niqoblash deb
+        // hisoblanmaydi, lekin noma'lum/qisqartirilgan domen bo'lgani uchun
+        // endi jim o'tkazib yuborilmay, AI tahliliga tushadi.
+        $res4 = $moderator->inspect('Batafsil', [[
+            'type' => 'text_link',
+            'offset' => 0,
+            'length' => 8,
+            'url' => 'https://tr.ee/Iv0aPh',
+        ]], 'economical', $chatId, 'ph4');
+        $this->assertFalse(
+            $res4['status'] === 'safe',
+            "Qisqartirilgan havola hech bo'lmasa AI tekshiruviga yuborilishi kerak, jim o'tmasligi"
+        );
+        $this->assertFalse(
+            ($res4['source'] ?? '') === 'local_rules',
+            "Qisqartirilgan havola mahalliy filtrdan 'toza' deb chiqib ketmasligi kerak"
+        );
+    }
+
+    /**
+     * 2.0 Phase 7: adminga boradigan moderatsiya xabari o'qilishi kerak.
+     *
+     * Avval u faqat raqamlardan iborat edi ("Guruh ID: -100...",
+     * "Foydalanuvchi: 8412100749", "Amal: REVIEW_ONLY") — admin qaysi guruh,
+     * kim va nima yozgani haqida hech narsa bilolmasdi.
+     */
+    public function testAdminLogShowsNamesMessageTextAndPlainLanguageReason(): void
+    {
+        $chatId = -100960100;
+        $adminId = 960101;
+        $offenderId = 960102;
+        $messageId = 7788;
+
+        $pdo = Database::getConnection();
+        $now = gmdate('Y-m-d H:i:s');
+        SettingsService::get($chatId); // guruh va sozlamalar yozuvini yaratadi
+        $pdo->prepare("UPDATE `groups` SET title = :t WHERE chat_id = :cid")
+            ->execute(['t' => 'Marhabo kv', 'cid' => $chatId]);
+        // Admin — xabar shu odamga boradi.
+        $pdo->exec("INSERT INTO chat_members (chat_id, user_id, role, updated_at) VALUES ({$chatId}, {$adminId}, 'creator', '{$now}')");
+        // Qoidabuzar foydalanuvchi va uning xabari.
+        $pdo->prepare("INSERT INTO users (user_id, first_name, last_name, username, is_bot, first_seen_at, last_seen_at) VALUES (:uid, 'Ali', 'Valiyev', 'alivaliyev', 0, :now, :now)")
+            ->execute(['uid' => $offenderId, 'now' => $now]);
+        $pdo->prepare("INSERT INTO messages (chat_id, message_id, user_id, media_type, raw_text, message_date, created_at) VALUES (:cid, :mid, :uid, 'text', :txt, :now, :now)")
+            ->execute([
+                'cid' => $chatId,
+                'mid' => $messageId,
+                'uid' => $offenderId,
+                'txt' => '35 000 000 so\'mgacha yordam olish uchun havolaga o\'ting',
+                'now' => $now,
+            ]);
+
+        $telegram = new class extends TelegramClient {
+            public array $sent = [];
+            public function sendMessage(int|string $chatId, string $text, array $extra = []): array
+            {
+                $this->sent[] = $text;
+                return ['ok' => true, 'result' => ['message_id' => 1]];
+            }
+        };
+
+        $punishment = new PunishmentService($telegram);
+        $punishment->execute($chatId, $offenderId, $messageId, [
+            'action' => 'review_only',
+            'delete_message' => false,
+            'notify_admin' => true,
+            'reason' => "Qo'lda ko'rib chiqish talab etiladi: Gemini xavfsizlik filtri javobni blokladi: PROHIBITED_CONTENT",
+            'evidence' => 'PROHIBITED_CONTENT',
+        ]);
+
+        $adminText = '';
+        foreach ($telegram->sent as $text) {
+            if (str_contains($text, 'Moderatsiya harakati')) {
+                $adminText = $text;
+                break;
+            }
+        }
+        $this->assertTrue($adminText !== '', "Adminga moderatsiya xabari yuborilishi kerak");
+
+        $this->assertStringContainsString('Marhabo kv', $adminText, "Guruh NOMI ko'rsatilishi kerak, faqat ID emas");
+        $this->assertStringContainsString('Ali Valiyev', $adminText, "Foydalanuvchi ISMI ko'rsatilishi kerak");
+        $this->assertStringContainsString('@alivaliyev', $adminText, "Username ko'rsatilishi kerak");
+        $this->assertStringContainsString('35 000 000', $adminText, "Qoidani buzgan XABAR MATNI ko'rsatilishi kerak");
+        $this->assertStringContainsString("qo'lda ko'rib chiqish kerak", $adminText, "Amal odamcha tilda yozilishi kerak");
+        $this->assertStringContainsString('AI kontentni tekshirishdan bosh tortdi', $adminText, "Texnik sabab tushuntirilishi kerak");
+
+        $this->assertFalse(
+            str_contains($adminText, 'REVIEW_ONLY'),
+            "Xom amal kodi ('REVIEW_ONLY') adminga ko'rsatilmasligi kerak"
+        );
+    }
 }

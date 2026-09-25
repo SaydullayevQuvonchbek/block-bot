@@ -11,6 +11,36 @@ use Throwable;
 
 class ProfileModerator
 {
+    /**
+     * 18+ / so'kinishdan TASHQARI, akkaunt darajasida chora ko'rishga arziydigan
+     * kategoriyalar (2.0 Phase 6). AI allaqachon shu kodlarni qaytaradi
+     * (`OpenRouterClient`/`GeminiClient` promptidagi kategoriyalar ro'yxati),
+     * lekin avval profil tekshiruvida ular E'TIBORSIZ qoldirilardi — faqat
+     * `pornography`/`adult_profile`/`profanity` hisobga olinardi. Amalda esa
+     * guruhlarga eng ko'p shu turdagi akkauntlar kiradi: kripto-"treyder"
+     * signal sotuvchilar, investitsiya/kazino targ'ibotchilari, referal spam
+     * tarqatuvchilar va reklama qiluvchi "chat-bot" akkauntlari.
+     */
+    public const PROMO_CATEGORIES = [
+        'trading_scam',
+        'spam_ad',
+        'gambling',
+        'malicious_link',
+        'apk_distribution',
+    ];
+
+    /** Profil ismi/username va bio tekshiruvida e'tiborga olinadigan barcha kategoriyalar. */
+    private const PROFILE_TEXT_CATEGORIES = [
+        'pornography',
+        'adult_profile',
+        'profanity',
+        'trading_scam',
+        'spam_ad',
+        'gambling',
+        'malicious_link',
+        'apk_distribution',
+    ];
+
     private TelegramClient $telegram;
     private TextModerator $textModerator;
     private MediaModerator $mediaModerator;
@@ -79,7 +109,7 @@ class ProfileModerator
         $fullName = trim("{$firstName} {$lastName} {$username}");
         if (!empty($fullName)) {
             $nameResult = $this->textModerator->inspect($fullName, [], 'economical', $chatId, "usr_{$userId}");
-            if ($nameResult['status'] === 'unsafe' && in_array($nameResult['category'], ['pornography', 'adult_profile', 'profanity'], true)) {
+            if ($nameResult['status'] === 'unsafe' && in_array($nameResult['category'], self::PROFILE_TEXT_CATEGORIES, true)) {
                 $this->updateUserStatus($userId, 'unsafe');
                 return [
                     'status' => 'unsafe',
@@ -87,6 +117,26 @@ class ProfileModerator
                     'reason' => "Profil ismida qoidabuzarlik aniqlandi: {$nameResult['reason']}",
                     'evidence' => $nameResult['evidence'] ?: $fullName,
                     'source' => 'profile_scan_name',
+                ];
+            }
+        }
+
+        // 2.1. Profil "bio" (about) matnini tekshirish — 2.0 Phase 6.
+        // Reklama/skam akkauntlar odatda ismini toza qoldirib, butun targ'ibotni
+        // (kripto signal kanali havolasi, "investitsiya" takliflari, referal
+        // kodlari) aynan bio'da saqlaydi — shuning uchun faqat ismni tekshirish
+        // amalda bu akkauntlarning ko'pini o'tkazib yuborardi.
+        $bio = $this->fetchBio($userId);
+        if ($bio !== null && $bio !== '') {
+            $bioResult = $this->textModerator->inspect($bio, [], 'economical', $chatId, "bio_{$userId}");
+            if ($bioResult['status'] === 'unsafe' && in_array($bioResult['category'], self::PROFILE_TEXT_CATEGORIES, true)) {
+                $this->updateUserStatus($userId, 'unsafe');
+                return [
+                    'status' => 'unsafe',
+                    'category' => $bioResult['category'],
+                    'reason' => "Profil bio'sida qoidabuzarlik aniqlandi: {$bioResult['reason']}",
+                    'evidence' => $bioResult['evidence'] ?: mb_substr($bio, 0, 200),
+                    'source' => 'profile_scan_bio',
                 ];
             }
         }
@@ -113,6 +163,32 @@ class ProfileModerator
             'evidence' => '',
             'source' => 'profile_scan',
         ];
+    }
+
+    /**
+     * Foydalanuvchining profil "bio" (about) matnini olish (2.0 Phase 6).
+     *
+     * Telegram Bot API'da bu `getChat(user_id)` orqali beriladi. Bot
+     * foydalanuvchini "ko'rmagan" bo'lsa yoki maxfiylik sozlamalari yopiq
+     * bo'lsa — xato emas, shunchaki `null` qaytadi va tekshiruv bu bosqichni
+     * jim o'tkazib yuboradi (hech qachon fatal bo'lmaydi).
+     */
+    private function fetchBio(int $userId): ?string
+    {
+        try {
+            $chat = $this->telegram->getChat($userId);
+            if (!is_array($chat)) {
+                return null;
+            }
+            $bio = trim((string)($chat['bio'] ?? $chat['description'] ?? ''));
+            return $bio !== '' ? $bio : null;
+        } catch (Throwable $e) {
+            Logger::warning("Profil bio'sini olishda xatolik", [
+                'user_id' => $userId,
+                'error' => $e->getMessage(),
+            ], 'moderation');
+            return null;
+        }
     }
 
     private function inspectProfilePhoto(int $userId, ?int $chatId): ?array
